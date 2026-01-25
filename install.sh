@@ -231,8 +231,11 @@ step "Creating directories..."
 mkdir -p "$WORKSPACE_DIR/logs"
 mkdir -p "$MESSAGES_DIR"/{inbox,outbox,processed,config,audio,task-outputs}
 mkdir -p "$INSTALL_DIR/scheduled-tasks"/{tasks,logs}
+mkdir -p "$HOME/projects"/{personal,business}
 
 success "Directories created"
+info "  ~/projects/personal - Personal projects"
+info "  ~/projects/business - Business/work projects"
 
 #===============================================================================
 # Scheduled Tasks Setup
