@@ -40,5 +40,11 @@ expect {
 # Send the initialization command
 send "Read CLAUDE.md and begin your main loop. Call wait_for_messages to start listening for Telegram messages. Never exit.\r"
 
+# Wait briefly for Claude to start processing
+sleep 3
+
+# Send another Enter in case the first one didn't register
+send "\r"
+
 # Hand over control - Claude runs forever
 interact
