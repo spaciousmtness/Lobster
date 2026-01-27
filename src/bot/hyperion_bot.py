@@ -35,11 +35,13 @@ if not ALLOWED_USERS:
 INBOX_DIR = Path.home() / "messages" / "inbox"
 OUTBOX_DIR = Path.home() / "messages" / "outbox"
 AUDIO_DIR = Path.home() / "messages" / "audio"
+IMAGES_DIR = Path.home() / "messages" / "images"
 
 # Ensure directories exist
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
 OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 # Logging
 LOG_DIR = Path.home() / "hyperion-workspace" / "logs"
@@ -136,6 +138,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_voice_message(update, context, msg_id)
         return
 
+    # Handle photo messages
+    if message.photo:
+        await handle_photo_message(update, context, msg_id)
+        return
+
+    # Handle document/file messages (including images sent as files)
+    if message.document:
+        await handle_document_message(update, context, msg_id)
+        return
+
     text = message.text
     if not text:
         return
@@ -206,6 +218,121 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text("❌ Failed to process voice message.")
 
 
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE, msg_id: str):
+    """Handle photo messages: download image and save to inbox with metadata."""
+    user = update.effective_user
+    message = update.message
+
+    try:
+        # Get the largest photo (last in the array)
+        photo = message.photo[-1]
+
+        # Download photo file from Telegram
+        file = await context.bot.get_file(photo.file_id)
+        image_filename = f"{msg_id}.jpg"
+        image_path = IMAGES_DIR / image_filename
+
+        await file.download_to_drive(image_path)
+        log.info(f"Downloaded photo to: {image_path}")
+
+        # Get caption if any
+        caption = message.caption or ""
+
+        # Create message file in inbox with photo metadata
+        msg_data = {
+            "id": msg_id,
+            "source": "telegram",
+            "type": "photo",
+            "chat_id": message.chat_id,
+            "user_id": user.id,
+            "username": user.username,
+            "user_name": user.first_name,
+            "text": caption if caption else "[Photo - see image_file]",
+            "image_file": str(image_path),
+            "image_width": photo.width,
+            "image_height": photo.height,
+            "file_id": photo.file_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+        inbox_file = INBOX_DIR / f"{msg_id}.json"
+        with open(inbox_file, 'w') as f:
+            json.dump(msg_data, f, indent=2)
+
+        log.info(f"Wrote photo message to inbox: {msg_id}")
+        await message.reply_text("📷 Image received. Processing...")
+
+    except Exception as e:
+        log.error(f"Error handling photo message: {e}")
+        await message.reply_text("❌ Failed to process image.")
+
+
+async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE, msg_id: str):
+    """Handle document messages: download file and save to inbox with metadata."""
+    user = update.effective_user
+    message = update.message
+    document = message.document
+
+    try:
+        # Check if it's an image sent as document
+        mime_type = document.mime_type or ""
+        is_image = mime_type.startswith("image/")
+
+        # Download file from Telegram
+        file = await context.bot.get_file(document.file_id)
+
+        # Determine extension and save location
+        original_name = document.file_name or "file"
+        ext = Path(original_name).suffix or (".jpg" if is_image else "")
+
+        if is_image:
+            save_path = IMAGES_DIR / f"{msg_id}{ext}"
+        else:
+            # For non-images, save to a general files directory
+            files_dir = Path.home() / "messages" / "files"
+            files_dir.mkdir(parents=True, exist_ok=True)
+            save_path = files_dir / f"{msg_id}{ext}"
+
+        await file.download_to_drive(save_path)
+        log.info(f"Downloaded document to: {save_path}")
+
+        # Get caption if any
+        caption = message.caption or ""
+
+        # Create message file in inbox
+        msg_data = {
+            "id": msg_id,
+            "source": "telegram",
+            "type": "image" if is_image else "document",
+            "chat_id": message.chat_id,
+            "user_id": user.id,
+            "username": user.username,
+            "user_name": user.first_name,
+            "text": caption if caption else f"[Document: {original_name}]",
+            "file_path": str(save_path),
+            "file_name": original_name,
+            "mime_type": mime_type,
+            "file_size": document.file_size,
+            "file_id": document.file_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+        if is_image:
+            msg_data["image_file"] = str(save_path)
+
+        inbox_file = INBOX_DIR / f"{msg_id}.json"
+        with open(inbox_file, 'w') as f:
+            json.dump(msg_data, f, indent=2)
+
+        log.info(f"Wrote document message to inbox: {msg_id}")
+        emoji = "📷" if is_image else "📎"
+        await message.reply_text(f"{emoji} File received. Processing...")
+
+    except Exception as e:
+        log.error(f"Error handling document message: {e}")
+        await message.reply_text("❌ Failed to process file.")
+
+
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.error(f"Error: {context.error}", exc_info=context.error)
 
@@ -233,6 +360,8 @@ async def run_bot():
     bot_app.add_handler(CommandHandler("start", start_command))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     bot_app.add_handler(MessageHandler(filters.VOICE, handle_message))
+    bot_app.add_handler(MessageHandler(filters.PHOTO, handle_message))
+    bot_app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
     bot_app.add_error_handler(error_handler)
 
     # Initialize and start
