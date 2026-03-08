@@ -22,29 +22,21 @@ LOG_DIR="$WORKSPACE/scheduled-jobs/logs"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 JOBS_FILE="$WORKSPACE/scheduled-jobs/jobs.json"
 
-# Ensure directories exist
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 
-# Check task file exists
 if [ ! -f "$TASK_FILE" ]; then
     echo "Error: Task file not found: $TASK_FILE"
     exit 1
 fi
 
-# Read task content
 TASK_CONTENT=$(cat "$TASK_FILE")
-
-# Log file for this execution
 LOG_FILE="$LOG_DIR/${JOB_NAME}-${TIMESTAMP}.log"
 
-# Record start time
 START_TIME=$(date +%s)
 START_ISO=$(date -Iseconds)
 
 echo "[$START_ISO] Starting job: $JOB_NAME" | tee "$LOG_FILE"
 
-# Run Claude with the task
-# The task instructions tell Claude to call write_task_output with results
 claude -p "$TASK_CONTENT
 
 ---
@@ -59,7 +51,6 @@ IMPORTANT: You are running as a scheduled task. When you complete your task:
 
 EXIT_CODE=$?
 
-# Record end time
 END_TIME=$(date +%s)
 END_ISO=$(date -Iseconds)
 DURATION=$((END_TIME - START_TIME))
@@ -67,7 +58,6 @@ DURATION=$((END_TIME - START_TIME))
 echo "" | tee -a "$LOG_FILE"
 echo "[$END_ISO] Job completed in ${DURATION}s with exit code: $EXIT_CODE" | tee -a "$LOG_FILE"
 
-# Update jobs.json with last_run info
 if [ -f "$JOBS_FILE" ]; then
     # Use jq if available, otherwise use Python
     if command -v jq &> /dev/null; then
