@@ -7,10 +7,19 @@ action outside the workspace without opening the door permanently.
 
 The agent itself can never call ``grant``: nothing under its control writes
 this file. Only a human-triggered approval path (outside this module) does.
+
+Every read-modify-write against the file (both `grant` and `consume`) holds
+an exclusive `flock` on a sidecar lock file for its whole critical section.
+Each PreToolUse call runs as its own OS process, so without a real lock two
+concurrent calls can both read the file before either writes it back --
+either double-consuming one grant, or a `grant` write racing a `consume`
+write and one silently clobbering the other.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -50,11 +59,28 @@ def _atomic_write(path: Path, data: dict) -> None:
         raise
 
 
+@contextlib.contextmanager
+def _locked(path: Path):
+    """Exclusive lock on `path`'s sidecar `.lock` file, held for one
+    read-modify-write cycle. `flock` is advisory but held on the open file
+    description, so it serializes both threads within one process and
+    separate OS processes hitting the same approvals file."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = path.parent / (path.name + ".lock")
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def grant(key: str, path: Path) -> None:
     """Record a one-shot approval for `key`, valid for TTL seconds from now."""
-    data = _load(path)
-    data[key] = time.time() + TTL
-    _atomic_write(path, data)
+    with _locked(path):
+        data = _load(path)
+        data[key] = time.time() + TTL
+        _atomic_write(path, data)
 
 
 def consume(key: str, path: Path, now: float) -> bool:
@@ -64,12 +90,13 @@ def consume(key: str, path: Path, now: float) -> bool:
     removed from the file as part of being consumed, whether or not it was
     expired, so a stale entry never lingers to be reused or raced.
     """
-    data = _load(path)
-    expiry = data.pop(key, None)
-    if expiry is None:
-        return False
-    if now > expiry:
+    with _locked(path):
+        data = _load(path)
+        expiry = data.pop(key, None)
+        if expiry is None:
+            return False
+        if now > expiry:
+            _atomic_write(path, data)
+            return False
         _atomic_write(path, data)
-        return False
-    _atomic_write(path, data)
-    return True
+        return True
