@@ -18,6 +18,7 @@ upstream advancing while the Mac install wasn't looking.
 """
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -51,7 +52,8 @@ line = " ".join(args)
 if "com.lobster.claude" in line:
     marker = "JSON_MISSING"
     workspace = os.environ.get("LOBSTER_WORKSPACE")
-    if workspace and (Path(workspace) / "logs" / "last-update.json").exists():
+    log_dir = os.environ.get("LOBSTER_LOG_DIR") or (workspace and str(Path(workspace) / "logs"))
+    if log_dir and (Path(log_dir) / "last-update.json").exists():
         marker = "JSON_PRESENT"
     line = f"{line} [{marker}]"
 
@@ -131,10 +133,12 @@ def repos(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _env_sandbox(tmp_path, monkeypatch):
-    # Default: exercise the code path with LOBSTER_UPDATE_REMOTE unset, same
-    # as an operator who never set it. Individual tests override as needed.
-    monkeypatch.delenv("LOBSTER_UPDATE_REMOTE", raising=False)
+    # Default: the merge path is only enabled by LOBSTER_UPDATE_REMOTE (M1),
+    # so point it at the fixture's `origin`, the Mac shape. Tests of the
+    # unset (Linux) behavior delenv it themselves.
+    monkeypatch.setenv("LOBSTER_UPDATE_REMOTE", "origin")
     monkeypatch.delenv("LOBSTER_SELFCHECK_CMD", raising=False)
+    monkeypatch.delenv("LOBSTER_LOG_DIR", raising=False)
     # A successful merge writes an outcome JSON and drops an inbox note --
     # point both at tmp_path so no test can ever touch the operator's real
     # ~/lobster-workspace or ~/messages.
@@ -234,6 +238,7 @@ def test_failed_selfcheck_rolls_back(repos, monkeypatch):
 
 def test_unset_remote_fast_forwardable_uses_original_path(repos, monkeypatch):
     upstream, seed, local = repos
+    monkeypatch.delenv("LOBSTER_UPDATE_REMOTE", raising=False)
 
     _push_new_commit(seed, upstream, "remote.txt", "remote change\n", "remote commit")
     head_before = _run("rev-parse", "HEAD", cwd=local).strip()
@@ -521,3 +526,69 @@ def test_selfcheck_router_timeout_exits_2_and_never_touches_claude(fake_launchct
     })
     assert result.returncode == 2
     assert "com.lobster.claude" not in _launchctl_log(fake_launchctl)
+
+
+# ---------------------------------------------------------------------------
+# Final fix wave
+# ---------------------------------------------------------------------------
+
+
+def test_unset_remote_with_local_commits_never_merges(repos, monkeypatch):
+    """M1: a Linux install (LOBSTER_UPDATE_REMOTE unset) that carries local
+    commits keeps the original ff-only behavior -- it refuses, it never
+    merges."""
+    upstream, seed, local = repos
+    monkeypatch.delenv("LOBSTER_UPDATE_REMOTE", raising=False)
+    monkeypatch.setenv("LOBSTER_SELFCHECK_CMD", "true")
+
+    _commit(local, "local.txt", "local change\n", "local commit")
+    head_before = _run("rev-parse", "HEAD", cwd=local).strip()
+    _push_new_commit(seed, upstream, "remote.txt", "remote change\n", "remote commit")
+
+    result = UpdateManager(repo_path=local)._execute_git_update()
+
+    assert result["success"] is False, result
+    assert _run("rev-parse", "HEAD", cwd=local).strip() == head_before
+    assert not (local / "remote.txt").exists()
+
+
+def test_outcome_goes_to_log_dir_not_workspace(repos, monkeypatch, tmp_path):
+    """I4: with LOBSTER_LOG_DIR set, last-update.json lands there and
+    nothing is written into the workspace."""
+    upstream, seed, local = repos
+    monkeypatch.setenv("LOBSTER_SELFCHECK_CMD", "true")
+    log_dir = tmp_path / "state" / "logs"
+    monkeypatch.setenv("LOBSTER_LOG_DIR", str(log_dir))
+
+    _commit(local, "local.txt", "local change\n", "local commit")
+    _push_new_commit(seed, upstream, "remote.txt", "remote change\n", "remote commit")
+
+    result = UpdateManager(repo_path=local)._execute_git_update()
+
+    assert result["success"] is True, result
+    assert json.loads((log_dir / "last-update.json").read_text())["status"] == "merged"
+    assert not (Path(os.environ["LOBSTER_WORKSPACE"]) / "logs" / "last-update.json").exists()
+
+
+DAILY_CHECK = Path(__file__).resolve().parents[2] / "scripts" / "daily-update-check.sh"
+
+
+def test_daily_update_check_ms_timestamp_is_numeric(repos, tmp_path):
+    """M2: `date +%s%3N` prints a literal "3N" on macOS; the id and file name
+    must be a plain 13-digit millisecond timestamp."""
+    upstream, seed, local = repos
+    lib = local / "scripts" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "json_message.sh").write_text(
+        (DAILY_CHECK.parent / "lib" / "json_message.sh").read_text())
+    _push_new_commit(seed, upstream, "remote.txt", "remote change\n", "remote commit")
+    messages = tmp_path / "dmsgs"
+    (messages / "inbox").mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items() if k != "LOBSTER_UPDATE_REMOTE"}
+    env.update(LOBSTER_INSTALL_DIR=str(local), LOBSTER_MESSAGES=str(messages),
+               LOBSTER_CONFIG_DIR=str(tmp_path / "noconfig"), HOME=str(tmp_path))
+    r = subprocess.run(["bash", str(DAILY_CHECK)], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    (note,) = list((messages / "inbox").glob("*.json"))
+    assert re.fullmatch(r"\d{13}_update_available\.json", note.name), note.name
+    assert re.fullmatch(r"\d{13}_update_available", json.loads(note.read_text())["id"])

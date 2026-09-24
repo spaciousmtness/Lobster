@@ -22,6 +22,17 @@ source "$LOBSTER_DIR/scripts/lib/json_message.sh"
 
 cd "$LOBSTER_DIR"
 
+# Milliseconds since the epoch. GNU date knows %3N; BSD/macOS date prints a
+# literal "3N", so fall back to whole seconds padded to milliseconds.
+_ms_now() {
+    local ts
+    ts=$(date +%s%3N)
+    case "$ts" in
+        *[!0-9]*) ts="$(date +%s)000" ;;
+    esac
+    printf '%s\n' "$ts"
+}
+
 # Support both git and tarball installs
 if [ -d "$LOBSTER_DIR/.git" ]; then
     REMOTE="${LOBSTER_UPDATE_REMOTE:-origin}"
@@ -56,7 +67,7 @@ if [ -d "$LOBSTER_DIR/.git" ]; then
         # $REMOTE/main by its own local commits isn't reported as behind.
         BEHIND=$(git rev-list --count "HEAD..$REMOTE/main")
         if [ "$BEHIND" -gt 0 ]; then
-            TIMESTAMP=$(date +%s%3N)
+            TIMESTAMP=$(_ms_now)
             _json_build_message \
                 --arg id "${TIMESTAMP}_update_available" \
                 --arg source "system" \
@@ -74,7 +85,7 @@ else
     LATEST_VERSION="${LATEST_TAG#v}"
 
     if [ -n "$LATEST_VERSION" ] && [ "$LATEST_VERSION" != "$CURRENT_VERSION" ]; then
-        TIMESTAMP=$(date +%s%3N)
+        TIMESTAMP=$(_ms_now)
         _json_build_message \
             --arg id "${TIMESTAMP}_update_available" \
             --arg source "system" \

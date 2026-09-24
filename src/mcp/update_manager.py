@@ -277,11 +277,13 @@ class UpdateManager:
         try:
             self._git("fetch", "--", remote, "main")
 
-            if remote == "origin" and self._is_ancestor("HEAD", "origin/main"):
-                # No local divergence from origin/main: keep the original
-                # fast-forward-only path (this is what a plain Linux install,
-                # or any dev machine tracking origin with no local commits,
-                # always hits).
+            merge_enabled = bool(os.environ.get("LOBSTER_UPDATE_REMOTE"))
+            if not merge_enabled or (remote == "origin" and self._is_ancestor("HEAD", "origin/main")):
+                # The original fast-forward-only path. Always taken when
+                # LOBSTER_UPDATE_REMOTE is unset (every Linux install): a
+                # Linux install carrying local commits gets the original
+                # ff-only refusal, never a merge. With it set (the Mac),
+                # still taken when there is nothing of ours to merge around.
                 current_sha = self._git("rev-parse", "HEAD").strip()
                 self._git("pull", "origin", "main", "--ff-only")
                 new_sha = self._git("rev-parse", "HEAD").strip()
@@ -465,9 +467,12 @@ class UpdateManager:
             pass
 
     def _write_update_outcome(self, outcome: dict) -> None:
+        # LOBSTER_LOG_DIR (the Mac: ~/.local/state/clawdaddy/logs) keeps this
+        # out of the agent-writable workspace, where a planted symlink could
+        # redirect the write. Unset, it stays in <workspace>/logs.
         workspace = Path(os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace")))
         try:
-            logs_dir = workspace / "logs"
+            logs_dir = Path(os.environ.get("LOBSTER_LOG_DIR") or (workspace / "logs"))
             logs_dir.mkdir(parents=True, exist_ok=True)
             (logs_dir / "last-update.json").write_text(json.dumps(outcome, indent=2) + "\n")
         except OSError:
