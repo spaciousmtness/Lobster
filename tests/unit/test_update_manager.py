@@ -31,7 +31,9 @@ class TestCheckForUpdates:
             result = MagicMock()
             result.returncode = 0
             result.stderr = ""
-            if "fetch" in cmd:
+            if cmd == ["git", "remote"]:
+                result.stdout = "origin\n"
+            elif "fetch" in cmd:
                 result.stdout = ""
             elif "rev-parse" in cmd and "HEAD" in cmd:
                 result.stdout = same_sha + "\n"
@@ -58,7 +60,9 @@ class TestCheckForUpdates:
             result = MagicMock()
             result.returncode = 0
             result.stderr = ""
-            if "fetch" in cmd:
+            if cmd == ["git", "remote"]:
+                result.stdout = "origin\n"
+            elif "fetch" in cmd:
                 result.stdout = ""
             elif "rev-parse" in cmd:
                 if "HEAD" in cmd:
@@ -339,7 +343,9 @@ class TestCreateUpgradePlan:
             result = MagicMock()
             result.returncode = 0
             result.stderr = ""
-            if "fetch" in cmd:
+            if cmd == ["git", "remote"]:
+                result.stdout = "origin\n"
+            elif "fetch" in cmd:
                 result.stdout = ""
             elif "rev-parse" in cmd:
                 result.stdout = same_sha + "\n"
@@ -366,7 +372,9 @@ class TestCreateUpgradePlan:
             result = MagicMock()
             result.returncode = 0
             result.stderr = ""
-            if "fetch" in cmd:
+            if cmd == ["git", "remote"]:
+                result.stdout = "origin\n"
+            elif "fetch" in cmd:
                 result.stdout = ""
             elif "rev-parse" in cmd:
                 if "HEAD" in cmd:
@@ -409,7 +417,9 @@ class TestCreateUpgradePlan:
             result = MagicMock()
             result.returncode = 0
             result.stderr = ""
-            if "fetch" in cmd:
+            if cmd == ["git", "remote"]:
+                result.stdout = "origin\n"
+            elif "fetch" in cmd:
                 result.stdout = ""
             elif "rev-parse" in cmd:
                 if "HEAD" in cmd:

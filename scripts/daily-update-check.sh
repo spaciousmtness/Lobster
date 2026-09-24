@@ -25,7 +25,28 @@ cd "$LOBSTER_DIR"
 # Support both git and tarball installs
 if [ -d "$LOBSTER_DIR/.git" ]; then
     REMOTE="${LOBSTER_UPDATE_REMOTE:-origin}"
-    git fetch "$REMOTE" main --quiet
+
+    # REMOTE is an env var, not network input, but it still reaches
+    # `git fetch` argv unquoted, and a value like "--upload-pack=<cmd>"
+    # there is arbitrary local command execution. Refuse anything that
+    # isn't a plain remote name git itself already knows about, before
+    # fetching anything.
+    case "$REMOTE" in
+        -*)
+            echo "daily-update-check: refusing remote '$REMOTE' (looks like an option)" >&2
+            exit 1
+            ;;
+    esac
+    if ! [[ "$REMOTE" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "daily-update-check: refusing invalid remote name '$REMOTE'" >&2
+        exit 1
+    fi
+    if ! git remote | grep -qx -- "$REMOTE"; then
+        echo "daily-update-check: '$REMOTE' is not a configured git remote" >&2
+        exit 1
+    fi
+
+    git fetch --quiet -- "$REMOTE" main
 
     LOCAL=$(git rev-parse HEAD)
     REMOTE_SHA=$(git rev-parse "$REMOTE/main")

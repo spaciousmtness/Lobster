@@ -24,6 +24,14 @@ LOBSTER_ROOT = Path(os.environ.get("LOBSTER_INSTALL_DIR", os.environ.get("LOBSTE
 GITHUB_REPO = "SiderealPress/lobster"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}"
 
+# A git remote name may never look like a git option: LOBSTER_UPDATE_REMOTE
+# is an env var, not user input over the network, but it still reaches
+# `git fetch <remote> ...` argv unquoted, and `--upload-pack=<cmd>` there is
+# arbitrary local command execution. Every remote value is checked against
+# this allowlist AND against `git remote`'s own output before it ever
+# reaches a subprocess argv.
+_REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
 
 def _installed_version(repo_path: Path) -> str:
     """Read the installed version from the VERSION file."""
@@ -55,15 +63,25 @@ class UpdateManager:
             return self._git_changelog(from_sha, to_sha)
         return self._release_changelog()
 
-    def analyze_compatibility(self, from_sha: str = None, to_sha: str = "origin/main") -> dict:
-        """Analyze breaking changes and compatibility issues."""
+    def analyze_compatibility(self, from_sha: str = None, to_sha: str = None) -> dict:
+        """Analyze breaking changes and compatibility issues.
+
+        to_sha defaults to None (rather than a hardcoded "origin/main") so it
+        always diffs against LOBSTER_UPDATE_REMOTE's main -- the same remote
+        _check_git_updates/_execute_git_update use -- instead of silently
+        comparing to origin/main on a Mac install that tracks upstream.
+        """
         if self.is_git:
+            if to_sha is None:
+                to_sha = f"{os.environ.get('LOBSTER_UPDATE_REMOTE', 'origin')}/main"
             return self._git_compatibility(from_sha, to_sha)
         return self._release_compatibility()
 
     def create_upgrade_plan(self) -> dict:
         """Create a complete upgrade plan."""
         update_info = self.check_for_updates()
+        if update_info.get("error") == "invalid remote":
+            return {"action": "none", "message": "invalid remote"}
         if not update_info.get("updates_available"):
             return {"action": "none", "message": "Already up to date."}
 
@@ -143,7 +161,9 @@ class UpdateManager:
 
     def _check_git_updates(self) -> dict:
         remote = os.environ.get("LOBSTER_UPDATE_REMOTE", "origin")
-        self._git("fetch", remote, "main")
+        if not self._validate_remote(remote):
+            return {"updates_available": False, "error": "invalid remote"}
+        self._git("fetch", "--", remote, "main")
         local_sha = self._git("rev-parse", "HEAD").strip()
         remote_sha = self._git("rev-parse", f"{remote}/main").strip()
 
@@ -243,17 +263,19 @@ class UpdateManager:
     _CASE_COLLISION_PHANTOM_PATHS = frozenset({"docs/SLACK-SETUP.md", "docs/slack-setup.md"})
 
     def _execute_git_update(self) -> dict:
-        compat = self.analyze_compatibility()
+        remote = os.environ.get("LOBSTER_UPDATE_REMOTE", "origin")
+        if not self._validate_remote(remote):
+            return {"success": False, "error": "invalid remote"}
+
+        compat = self.analyze_compatibility(to_sha=f"{remote}/main")
         if not compat["safe_to_update"]:
             return {
                 "success": False,
                 "message": "Cannot auto-update. Issues: " + "; ".join(compat["issues"]),
             }
 
-        remote = os.environ.get("LOBSTER_UPDATE_REMOTE", "origin")
-
         try:
-            self._git("fetch", remote, "main")
+            self._git("fetch", "--", remote, "main")
 
             if remote == "origin" and self._is_ancestor("HEAD", "origin/main"):
                 # No local divergence from origin/main: keep the original
@@ -287,7 +309,10 @@ class UpdateManager:
         """Merge <remote>/main into HEAD, with rollback on conflict or a
         failing selfcheck. Only reached when the ff-only path above does not
         apply: a non-origin remote (Clawdaddy's `upstream`), or HEAD has
-        diverged from origin/main (local commits on top of it)."""
+        diverged from origin/main (local commits on top of it).
+
+        `remote` is assumed already validated by the caller (_execute_git_update)
+        -- this method never re-derives it from the environment."""
         status = self._git("status", "--porcelain", "--untracked-files=no")
         dirty = [
             line for line in status.splitlines()
@@ -307,35 +332,98 @@ class UpdateManager:
 
         if merge.returncode != 0:
             conflicts = self._git("diff", "--name-only", "--diff-filter=U").strip()
-            # git reset --hard is allowed only inside this rollback branch,
-            # only to the sha this same call recorded above, and only after
-            # a merge this same call made -- never on the caller's say-so.
+            # git reset --hard is allowed only inside a rollback branch below,
+            # only to the sha this same call recorded above, and only after a
+            # merge this same call made -- never on the caller's say-so.
             subprocess.run(["git", "merge", "--abort"], cwd=self.repo_path, capture_output=True)
+            if conflicts:
+                return {
+                    "success": False,
+                    "error": "conflict",
+                    "files": conflicts.split("\n"),
+                }
+            # git refused to even start the merge (e.g. an untracked file in
+            # the working tree would be overwritten) -- there is no conflict
+            # to list, so don't call it one. Nothing was started; nothing to
+            # abort was in progress; git's own message says why.
             return {
                 "success": False,
-                "error": "conflict",
-                "files": conflicts.split("\n") if conflicts else [],
+                "error": "merge refused",
+                "message": (merge.stderr or merge.stdout).strip(),
             }
 
         new_sha = self._git("rev-parse", "HEAD").strip()
+        merged_log = self._git("log", "--oneline", f"{previous_sha}..{new_sha}").strip()
+        merged_commits = merged_log.split("\n") if merged_log else []
 
         selfcheck_cmd = os.environ.get("LOBSTER_SELFCHECK_CMD")
-        if selfcheck_cmd:
-            selfcheck = subprocess.run(selfcheck_cmd, shell=True, cwd=self.repo_path, capture_output=True)
-        else:
-            selfcheck = subprocess.run(
-                ["bash", "macos/selfcheck.sh"], cwd=self.repo_path, capture_output=True,
-            )
+        try:
+            if selfcheck_cmd:
+                selfcheck_rc = subprocess.run(
+                    selfcheck_cmd, shell=True, cwd=self.repo_path, capture_output=True, timeout=600,
+                ).returncode
+            else:
+                selfcheck_rc = subprocess.run(
+                    ["bash", "macos/selfcheck.sh"], cwd=self.repo_path, capture_output=True, timeout=600,
+                ).returncode
+        except subprocess.TimeoutExpired:
+            # A hung selfcheck is a failed one -- roll back rather than leave
+            # the merge in place with no verdict.
+            selfcheck_rc = 1
 
-        if selfcheck.returncode != 0:
+        if selfcheck_rc == 2:
+            # selfcheck's contract: exit 2 means it kickstarted the router
+            # onto the merged code and the router never reached `state =
+            # running`, and selfcheck never touched com.lobster.claude.
+            # Roll back the tree, then put the router back on the
+            # last-known-good sha it just failed to leave.
+            self._git("reset", "--hard", previous_sha)
+            self._kickstart_service("com.lobster.router")
+            outcome = {
+                "before": previous_sha,
+                "after": new_sha,
+                "merged_commits": merged_commits,
+                "status": "rolled back: router failed to start",
+                "timestamp": datetime.now().astimezone().isoformat(),
+            }
+            self._write_update_outcome(outcome)
+            self._post_update_inbox_note(
+                f"Lobster update rolled back: merging {remote}/main "
+                f"({previous_sha[:7]} -> {new_sha[:7]}) left the router unable to start. "
+                f"Reverted to {previous_sha[:7]} and restarted it."
+            )
+            return {"success": False, "error": "selfcheck failed, rolled back", "reason": "router failed to start"}
+
+        if selfcheck_rc != 0:
             self._git("reset", "--hard", previous_sha)
             return {"success": False, "error": "selfcheck failed, rolled back"}
+
+        outcome = {
+            "before": previous_sha,
+            "after": new_sha,
+            "merged_commits": merged_commits,
+            "status": "merged",
+            "timestamp": datetime.now().astimezone().isoformat(),
+        }
+        # Written and posted BEFORE the claude kickstart below: that
+        # kickstart restarts the very dispatcher that called this update, so
+        # the outcome has to already be on disk (and in the inbox) for it to
+        # find when it comes back up.
+        self._write_update_outcome(outcome)
+        self._post_update_inbox_note(
+            f"Lobster updated: merged {remote}/main ({previous_sha[:7]} -> {new_sha[:7]}), "
+            f"{len(merged_commits)} commit(s)."
+        )
+
+        if self._service_loaded("com.lobster.claude"):
+            self._kickstart_service("com.lobster.claude")
 
         return {
             "success": True,
             "previous_sha": previous_sha,
             "current_sha": new_sha,
             "message": f"Merged {remote}/main: {previous_sha[:7]} to {new_sha[:7]}",
+            "rollback_command": f"git reset --hard {previous_sha}",
         }
 
     def _is_ancestor(self, commit: str, of: str) -> bool:
@@ -345,6 +433,68 @@ class UpdateManager:
             capture_output=True,
         )
         return result.returncode == 0
+
+    def _validate_remote(self, remote: str) -> bool:
+        """Whitelist-validate a remote name before it ever reaches a git
+        argv: alphanumerics/._- only, never leading with '-' (which git would
+        parse as an option, e.g. `--upload-pack=<cmd>`), and only a name
+        `git remote` actually knows about."""
+        if not remote or remote.startswith("-") or not _REMOTE_NAME_RE.match(remote):
+            return False
+        result = subprocess.run(
+            ["git", "remote"], cwd=self.repo_path, capture_output=True, text=True,
+        )
+        return remote in result.stdout.split()
+
+    def _service_loaded(self, label: str) -> bool:
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True,
+        )
+        return result.returncode == 0
+
+    def _kickstart_service(self, label: str) -> None:
+        """Best-effort: a failed kickstart here must never fail the update
+        result that's already been decided by the time this is called."""
+        try:
+            subprocess.run(
+                ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+                capture_output=True,
+            )
+        except Exception:
+            pass
+
+    def _write_update_outcome(self, outcome: dict) -> None:
+        workspace = Path(os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace")))
+        try:
+            logs_dir = workspace / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            (logs_dir / "last-update.json").write_text(json.dumps(outcome, indent=2) + "\n")
+        except OSError:
+            pass  # never let a logging failure block the update result
+
+    def _post_update_inbox_note(self, text: str) -> None:
+        """Drop a system inbox message so Clawdaddy tells Melissa what
+        happened after it restarts. Same source/shape convention as
+        scripts/daily-update-check.sh: source="system" (the only value the
+        inbox server's quarantine guard accepts for a system-generated
+        message -- "internal" is not in INBOX_MESSAGE_SOURCES and would be
+        quarantined to failed/, which is the opposite of what this is for)."""
+        inbox_dir = Path(os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))) / "inbox"
+        try:
+            inbox_dir.mkdir(parents=True, exist_ok=True)
+            msg_id = f"{int(datetime.now().timestamp() * 1000)}_update_status"
+            payload = {
+                "id": msg_id,
+                "source": "system",
+                "chat_id": 0,
+                "type": "update_notification",
+                "text": text,
+                "timestamp": datetime.now().astimezone().isoformat(),
+            }
+            (inbox_dir / f"{msg_id}.json").write_text(json.dumps(payload))
+        except OSError:
+            pass  # never let a logging failure block the update result
 
     def _git(self, *args) -> str:
         result = subprocess.run(
