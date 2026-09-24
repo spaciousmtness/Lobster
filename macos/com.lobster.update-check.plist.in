@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.lobster.update-check.plist.in - launchd LaunchAgent template for the
+  daily update check (scripts/daily-update-check.sh).
+
+  TEMPLATE: install.sh replaces every @HOME@ with the target home directory
+  and writes the result to ~/Library/LaunchAgents/com.lobster.update-check.plist.
+  launchd does not expand HOME or ~ in plist files, so this substitution has
+  to happen before the file is written; do not load this file directly.
+
+  This is a scheduled job, not a daemon: StartCalendarInterval runs it once a
+  day at 09:00 local time, and it is deliberately not KeepAlive (a one-shot
+  check has nothing to keep alive between runs).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lobster.update-check</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@HOME@/lobster/macos/run-with-env.sh</string>
+        <string>@HOME@/lobster/scripts/daily-update-check.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@HOME@/lobster</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/lobster-workspace/logs/update-check-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@HOME@/lobster-workspace/logs/update-check-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+    </dict>
+</dict>
+</plist>

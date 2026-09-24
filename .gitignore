@@ -6,6 +6,7 @@
 !config.env.example
 !mcp-http-auth.env.example
 !bridge-local.example.env
+!macos/mac.env
 config.env
 
 # Python

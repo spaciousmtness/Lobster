@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.lobster.claude.plist.in - launchd LaunchAgent template for the
+  persistent Claude dispatcher (scripts/claude-persistent.sh).
+
+  TEMPLATE: install.sh replaces every @HOME@ with the target home directory
+  and writes the result to ~/Library/LaunchAgents/com.lobster.claude.plist.
+  launchd does not expand HOME or ~ in plist files, so this substitution has
+  to happen before the file is written; do not load this file directly.
+
+  claude-persistent.sh needs BASHPID, which macOS's bundled bash (3.2) does
+  not have, so it is run with /opt/homebrew/bin/bash explicitly rather than
+  relying on its own shebang.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lobster.claude</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@HOME@/lobster/macos/run-with-env.sh</string>
+        <string>/opt/homebrew/bin/bash</string>
+        <string>@HOME@/lobster/scripts/claude-persistent.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@HOME@/lobster-workspace</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/lobster-workspace/logs/claude-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@HOME@/lobster-workspace/logs/claude-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.lobster.router.plist.in - launchd LaunchAgent template for the router
+  (the Telegram bot, src/bot/lobster_bot.py).
+
+  TEMPLATE: install.sh replaces every @HOME@ with the target home directory
+  and writes the result to ~/Library/LaunchAgents/com.lobster.router.plist.
+  launchd does not expand HOME or ~ in plist files, so this substitution has
+  to happen before the file is written; do not load this file directly.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lobster.router</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@HOME@/lobster/macos/run-with-env.sh</string>
+        <string>@HOME@/lobster/.venv/bin/python</string>
+        <string>@HOME@/lobster/src/bot/lobster_bot.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@HOME@/lobster</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/lobster-workspace/logs/router-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@HOME@/lobster-workspace/logs/router-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+    </dict>
+</dict>
+</plist>
