@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Reach guard: the PreToolUse hook that confines Clawdaddy to its workspace.
 
-Claude Code calls this before every tool use. In order:
+Claude Code calls this before every tool use. In order (non-Bash tools):
   0. an unlisted tool is refused outright ("tool not permitted")
+  C3. a `..` component anywhere in a Glob pattern or Grep glob denies
+      outright, grant or no grant
   1. a hard-denied location is denied no matter what, grant or no grant
-     ("never allowed")
+     ("never allowed") -- checked against `home` AND against the `messages`
+     argument (inbox/config under either)
   6. for a recursive tool (Grep/Glob/LS), a target that merely CONTAINS a
-     hard-denied location is denied too -- a grant on a parent can't
-     authorize walking into the secret underneath it
+     hard-denied location (including ~/messages, an ancestor of its own
+     inbox/config) is denied too -- a grant on a parent can't authorize
+     walking into the secret underneath it. A missing "path" is judged as
+     if it were the resolved cwd.
   2. tools with no path of their own (WebFetch, WebSearch, the inbox
      page-fetcher) always need a fresh grant
   5. Lobster's own MCP tools are always allowed
@@ -16,16 +21,23 @@ Claude Code calls this before every tool use. In order:
      subfolder other than inbox/config
   4. otherwise, only a matching one-shot approval lets it through
 
-Bash is judged by the whole command string rather than by picking out
-tokens (tokens are too easy to hide a path inside): it's auto-allowed only
-when the working directory is inside the workspace and the command has
-no way to reach outside it (see `_bash_looks_safe`); anything else falls
-back to rule 4, and a hard-denied location anywhere in the command text
-denies outright per rule 1.
+Bash: every call needs a one-shot grant for that exact call -- there is no
+auto-allow path. A hard-denied location named anywhere in the command text
+still denies outright, even with a grant; the match is robust against
+shell quoting tricks (`.s''sh` -> `.ssh`) and glob wildcards (`.ss?`
+matching `.ssh`) used to break a sensitive name up.
+
+Every relative path argument (and a Glob/Grep pattern's fixed base) resolves
+against the stdin `cwd`, not the workspace -- a Bash-adjacent tool call
+genuinely runs relative to wherever the agent's shell currently is. A
+Grep/Glob/LS call with no `path` argument at all is judged as though
+`path` were that same cwd.
 
 `~` is expanded against the `home` argument this call was made with, never
-against the real process `$HOME` -- the two are the same value in the real
-CLI, but a test's fake `home` must not leak the real machine's paths in.
+against the real process `$HOME`. `home`, `workspace` and `messages` are
+each `.resolve()`d once at the top of `decide()`, so a symlinked `home`
+(or workspace, or messages) is judged by what it actually points at, the
+same way every individual path argument already is.
 
 Fails closed: any exception during the CLI's decision-making prints a deny.
 """
@@ -72,16 +84,6 @@ HARD_DENIED_GLOB_RELATIVE = (
     "Library/Group Containers/*1password*",
 )
 
-# Used by the rule-6 ancestor check for recursive tools (Grep/Glob/LS): a
-# target that contains one of these is denied even with a grant, because
-# recursing into it would read the secret underneath. ~/messages/inbox and
-# ~/messages/config are excluded here on purpose -- reading ~/messages
-# itself only needs a grant (rule 4), it isn't hard-denied; only the
-# inbox/config subfolders themselves are (rule 1, checked separately).
-ANCESTOR_CHECK_RELATIVE = tuple(
-    e for e in HARD_DENIED_RELATIVE if e not in ("messages/inbox", "messages/config")
-)
-
 # Outside the workspace, a file whose name merely looks like a secret is
 # treated as one -- catches stray credential files hard-denial didn't
 # anticipate by exact location. Checked against every path component, not
@@ -106,7 +108,8 @@ NO_PATH_TOOLS = ("WebFetch", "WebSearch", "mcp__lobster-inbox__fetch_page")
 MESSAGES_EXEMPT_TOOLS = ("Read", "Glob", "Grep")
 
 # Tools that can recurse into a directory tree: a hard-denied location lying
-# anywhere under their target is denied outright (rule 6).
+# anywhere under their target is denied outright (rule 6), and a missing
+# "path" argument is judged as if it were the resolved cwd.
 RECURSIVE_TOOLS = ("Grep", "Glob", "LS")
 
 # The only tools Clawdaddy is permitted to call at all. An unlisted
@@ -138,68 +141,102 @@ DENY_NEEDS_APPROVAL = (
 )
 
 # ---------------------------------------------------------------------------
-# Bash: judged as a whole command string, not by picking out tokens.
+# Bash: every call needs its own one-shot grant. There is no auto-allow
+# path -- the only question left is whether the command names a hard-denied
+# location, which loses even with a grant.
 # ---------------------------------------------------------------------------
 
-# A "/" or "~" immediately preceded by nothing (start of string) or by
-# whitespace/an operator/quote character is a path lead-in a plain word
-# like "notes" or "my/relative/thing" can't produce.
-_BASH_PATH_LEAD_RE = re.compile(r"""(^|[\s=@<>:'"(,;|&])(/|~)""")
-
-_BASH_DENYLIST_WORDS = frozenset(
-    {
-        "python",
-        "python3",
-        "node",
-        "ruby",
-        "perl",
-        "osascript",
-        "sh",
-        "bash",
-        "zsh",
-        "eval",
-        "source",
-        "exec",
-        "env",
-        "xargs",
-        "find",
-        "open",
-        "sudo",
-    }
-)
-
-# Signatures checked as plain case-insensitive substrings of the whole Bash
-# command string -- this alone catches a hard-denied location written as an
-# absolute path, a "~/" form, a "$HOME/" form, or its bare home-relative
-# name, since all four forms contain the same distinctive substring.
+# Signatures checked against the normalized command string -- catches a
+# hard-denied location however it's written (absolute, "~/" form, "$HOME/"
+# form, or bare home-relative name), since all four forms contain the same
+# distinctive substring.
 _BASH_HARD_DENIED_SIGNATURES = tuple(
     sorted({e.casefold() for e in HARD_DENIED_RELATIVE} | {"lobster/config", "1password"})
 )
 
+# Characters bash quoting can use to split a sensitive name up without
+# changing what the shell actually sees (`.s''sh` -> `.ssh`).
+_BASH_QUOTE_CHARS = ("'", '"')
+
+# A brace group has no native fnmatch equivalent; coarsening it to a single
+# wildcard is the safe (over-inclusive, i.e. more likely to deny) direction.
+_BASH_BRACE_RE = re.compile(r"\{[^{}]*\}")
+
+_BASH_WILDCARD_CHARS = "*?["
+
+# Cap on the windowed wildcard scan below, purely to bound worst-case work
+# for a pathologically long command; the plain substring check (which
+# catches the large majority of real attempts, quoting tricks included)
+# still runs regardless of length. The scan only considers windows whose
+# length is close to the signature's own length (a small amount of slack
+# either way, for a `*`/`{...}` swallowing or contributing a couple of
+# characters) -- a short fragment like "*.json" must NOT be allowed to
+# match a long signature like ".claude/.credentials.json" just because it
+# happens to share a generic trailing extension.
+_BASH_SCAN_MAX_LEN = 600
+_BASH_SCAN_SLACK_SHORTER = 2
+_BASH_SCAN_SLACK_LONGER = 3
+
+
+def _bash_normalize(command: str) -> str:
+    """Strip characters bash quoting/escaping could use to split up a
+    sensitive name, then casefold."""
+    normalized = command
+    for ch in _BASH_QUOTE_CHARS:
+        normalized = normalized.replace(ch, "")
+    normalized = normalized.replace("\\", "")
+    return normalized.casefold()
+
+
+def _bash_could_name(normalized: str, signature: str) -> bool:
+    """True if `signature` appears literally in `normalized`, or could be
+    produced by some window of it once ?, *, [...] and {...} are treated as
+    shell wildcards standing in for characters of `signature`."""
+    if signature in normalized:
+        return True
+
+    candidate = _BASH_BRACE_RE.sub("*", normalized)
+    if signature in candidate:
+        return True
+    if not any(c in candidate for c in _BASH_WILDCARD_CHARS):
+        return False
+    if len(candidate) > _BASH_SCAN_MAX_LEN:
+        return False
+
+    sig_len = len(signature)
+    n = len(candidate)
+    min_len = max(1, sig_len - _BASH_SCAN_SLACK_SHORTER)
+    max_len = sig_len + _BASH_SCAN_SLACK_LONGER
+    if n < min_len:
+        return False  # too short to contain a window of sufficient length at all
+    for start in range(0, n - min_len + 1):
+        max_end = min(n, start + max_len)
+        for end in range(start + min_len, max_end + 1):
+            window = candidate[start:end]
+            has_wildcard = any(c in window for c in _BASH_WILDCARD_CHARS)
+            has_literal = any(c not in _BASH_WILDCARD_CHARS for c in window)
+            # A window with no literal characters at all (e.g. a bare "*")
+            # is *, and fnmatch(anything, "*") is trivially True -- that's
+            # not evidence the command names anything in particular, so it
+            # doesn't count as a match on its own. Nor does a short generic
+            # fragment (like "*.json") whose length is far below the whole
+            # signature's -- the length bounds above already exclude it.
+            if not (has_wildcard and has_literal):
+                continue
+            if fnmatch.fnmatch(signature, window):
+                return True
+    return False
+
 
 def _bash_hard_denied(command: str) -> bool:
-    lowered = command.casefold()
-    return any(sig in lowered for sig in _BASH_HARD_DENIED_SIGNATURES)
+    normalized = _bash_normalize(command)
+    return any(_bash_could_name(normalized, sig) for sig in _BASH_HARD_DENIED_SIGNATURES)
 
 
-def _bash_looks_safe(command: str) -> bool:
-    """True only when the command can't be read as reaching outside the cwd."""
-    if _BASH_PATH_LEAD_RE.search(command):
-        return False
-    if "$" in command or "`" in command or ".." in command:
-        return False
-    words = re.split(r"[\s;|&()]+", command)
-    return not any(w in _BASH_DENYLIST_WORDS for w in words if w)
-
-
-def _decide_bash(
-    tool_input: dict, workspace: Path, resolved_cwd: Path, approvals_path: Path, now: float
-) -> tuple[str, str]:
+def _decide_bash(tool_input: dict, approvals_path: Path, now: float) -> tuple[str, str]:
     command = tool_input.get("command", "") or ""
     if _bash_hard_denied(command):
         return "deny", DENY_NEVER_ALLOWED
-    if _inside_casefold(resolved_cwd, workspace) and _bash_looks_safe(command):
-        return "allow", "safe bash inside your folder"
     k = approvals.key("Bash", tool_input)
     if approvals.consume(k, approvals_path, now):
         return "allow", "one-shot approval consumed"
@@ -249,13 +286,27 @@ def _resolve(raw: str, base: Path, home: Path) -> Path:
 
 
 def _pattern_fixed_prefix(pattern: str) -> str:
-    """The portion of a glob pattern before its first wildcard character."""
+    """The complete-directory portion of a glob pattern before its first
+    wildcard segment. Cut at the last "/" before the first wildcard
+    character rather than mid-segment, so a partial name like ".S" cut out
+    of ".S*/*" can never be mistaken for a safe, fully-specified path
+    component -- the boundary lands on the last directory we can actually
+    be sure of."""
     cut = len(pattern)
     for ch in ("*", "?", "["):
         pos = pattern.find(ch)
         if pos != -1 and pos < cut:
             cut = pos
-    return pattern[:cut]
+    if cut == len(pattern):
+        return pattern  # no wildcard at all
+    last_slash = pattern.rfind("/", 0, cut)
+    if last_slash == -1:
+        return ""  # wildcard in the very first segment -- nothing fixed to judge
+    return pattern[: last_slash + 1]
+
+
+def _pattern_has_dotdot(pattern: str) -> bool:
+    return any(part == ".." for part in pattern.split("/"))
 
 
 def _gather_raw_paths(tool_input: dict) -> list[str]:
@@ -268,7 +319,7 @@ def _gather_raw_paths(tool_input: dict) -> list[str]:
 
 
 def _gather_pattern_candidates(
-    tool_name: str, tool_input: dict, workspace: Path, home: Path
+    tool_name: str, tool_input: dict, base_dir: Path, home: Path
 ) -> list[Path]:
     field = PATTERN_KEYS.get(tool_name)
     if not field:
@@ -278,9 +329,9 @@ def _gather_pattern_candidates(
         return []
     base_raw = tool_input.get("path")
     base = (
-        _resolve(base_raw, workspace, home)
+        _resolve(base_raw, base_dir, home)
         if isinstance(base_raw, str) and base_raw
-        else workspace
+        else base_dir
     )
     prefix = _pattern_fixed_prefix(raw_pattern)
     if not prefix:
@@ -339,7 +390,7 @@ def _inside_messages_readable(resolved: Path, messages: Path) -> bool:
     return rel_parts[0].casefold() not in ("inbox", "config")
 
 
-def _is_hard_denied(resolved: Path, home: Path, workspace: Path) -> bool:
+def _is_hard_denied(resolved: Path, home: Path, workspace: Path, messages: Path) -> bool:
     rel_parts = _relative_parts_casefold(resolved, home)
     if rel_parts is not None:
         if any(_matches_relative_entry(rel_parts, entry) for entry in HARD_DENIED_RELATIVE):
@@ -347,6 +398,12 @@ def _is_hard_denied(resolved: Path, home: Path, workspace: Path) -> bool:
         for pattern in HARD_DENIED_GLOB_RELATIVE:
             if _matches_glob_entry(rel_parts, tuple(pattern.split("/"))):
                 return True
+
+    # inbox/config are hard-denied relative to the `messages` argument too,
+    # not only when messages happens to live at home/"messages".
+    messages_rel = _relative_parts_casefold(resolved, messages)
+    if messages_rel and messages_rel[0].casefold() in ("inbox", "config"):
+        return True
 
     if not _inside_casefold(resolved, workspace):
         if any(
@@ -362,7 +419,9 @@ def _is_hard_denied(resolved: Path, home: Path, workspace: Path) -> bool:
 def _is_ancestor_of_denied(target: Path, home: Path) -> bool:
     """True if a hard-denied location lies at or under `target` -- i.e.
     `target` is an ancestor of (or equal to) it. Used to stop a recursive
-    tool from being granted a broad target that quietly contains a secret."""
+    tool from being granted a broad target that quietly contains a secret
+    -- this includes ~/messages itself, since messages/inbox and
+    messages/config sit under it."""
     rel_parts = _relative_parts_casefold(target, home)
     if rel_parts is None:
         # target isn't under home; the only way it's still an ancestor of
@@ -372,7 +431,7 @@ def _is_ancestor_of_denied(target: Path, home: Path) -> bool:
     target_cf = tuple(p.casefold() for p in rel_parts)
     depth = len(target_cf)
 
-    for entry in ANCESTOR_CHECK_RELATIVE:
+    for entry in HARD_DENIED_RELATIVE:
         entry_cf = tuple(p.casefold() for p in entry.split("/"))
         if depth <= len(entry_cf) and entry_cf[:depth] == target_cf:
             return True
@@ -402,24 +461,38 @@ def decide(
     cwd: "str | Path | None" = None,
     messages: "str | Path | None" = None,
 ) -> tuple[str, str]:
-    home = Path(home)
-    workspace = Path(workspace)
-    messages = Path(messages) if messages is not None else home / "messages"
+    home = Path(home).resolve()
+    workspace = Path(workspace).resolve()
+    messages = Path(messages).resolve() if messages is not None else (home / "messages").resolve()
 
     # Rule 0: an unlisted tool is refused outright.
     if not _tool_allowed(tool_name):
         return "deny", DENY_TOOL_NOT_PERMITTED
 
     if tool_name == "Bash":
-        resolved_cwd = _resolve(str(cwd), workspace, home) if cwd is not None else workspace
-        return _decide_bash(tool_input, workspace, resolved_cwd, approvals_path, now)
+        return _decide_bash(tool_input, approvals_path, now)
+
+    resolved_cwd = _resolve(str(cwd), workspace, home) if cwd is not None else workspace
 
     raw_paths = _gather_raw_paths(tool_input)
-    resolved_paths = [_resolve(p, workspace, home) for p in raw_paths]
-    resolved_paths += _gather_pattern_candidates(tool_name, tool_input, workspace, home)
+    resolved_paths = [_resolve(p, resolved_cwd, home) for p in raw_paths]
+    resolved_paths += _gather_pattern_candidates(tool_name, tool_input, resolved_cwd, home)
+
+    # A Grep/Glob/LS call with no explicit "path" is judged as though it
+    # targeted the cwd it's actually going to run relative to.
+    if tool_name in RECURSIVE_TOOLS and not tool_input.get("path"):
+        resolved_paths.append(resolved_cwd)
+
+    # Rule (C3): a ".." component in a Glob pattern or Grep glob is denied
+    # outright, grant or no grant -- resolution alone isn't trusted here.
+    pattern_field = PATTERN_KEYS.get(tool_name)
+    if pattern_field:
+        raw_pattern = tool_input.get(pattern_field)
+        if isinstance(raw_pattern, str) and _pattern_has_dotdot(raw_pattern):
+            return "deny", DENY_NEVER_ALLOWED
 
     # Rule 1: hard-denied locations always lose, grant or no grant.
-    if any(_is_hard_denied(r, home, workspace) for r in resolved_paths):
+    if any(_is_hard_denied(r, home, workspace, messages) for r in resolved_paths):
         return "deny", DENY_NEVER_ALLOWED
 
     # Rule 6: a recursive tool whose target contains a hard-denied location
