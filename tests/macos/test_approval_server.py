@@ -27,8 +27,22 @@ def test_stranger_and_other_request_ignored(tmp_path):
 def test_outbox_message_has_buttons(tmp_path):
     msg = s.build_request(285289661, "abc", "Read ~/Documents/x.md", "to summarize it")
     assert msg["chat_id"] == 285289661 and msg["source"] == "telegram"
-    assert msg["buttons"] == [[{"text": "Yes", "callback_data": "approve:abc"},
-                               {"text": "No", "callback_data": "deny:abc"}]]
+    # The router's build_inline_keyboard reads [label, callback_data] pairs.
+    assert msg["buttons"] == [[["Yes", "approve:abc"], ["No", "deny:abc"]]]
+
+
+def test_buttons_render_through_the_real_router_builder():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "bot"))
+    import os
+    os.environ.setdefault("TELEGRAM_BOT_TOKEN", "0:test")
+    os.environ.setdefault("TELEGRAM_ALLOWED_USERS", "1")
+    from lobster_bot import build_inline_keyboard
+    msg = s.build_request(285289661, "abc", "x", "y")
+    kb = build_inline_keyboard(msg["buttons"])
+    row = kb.inline_keyboard[0]
+    assert [(b.text, b.callback_data) for b in row] == [("Yes", "approve:abc"), ("No", "deny:abc")]
 
 
 # ---------------------------------------------------------------------------

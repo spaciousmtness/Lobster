@@ -171,10 +171,12 @@ def build_request(
         "chat_id": owner_id,
         "text": "\n".join(lines),
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        # [label, callback_data] pairs: the shape the router's
+        # build_inline_keyboard reads from outbox files.
         "buttons": [
             [
-                {"text": "Yes", "callback_data": f"approve:{request_id}"},
-                {"text": "No", "callback_data": f"deny:{request_id}"},
+                ["Yes", f"approve:{request_id}"],
+                ["No", f"deny:{request_id}"],
             ]
         ],
     }
