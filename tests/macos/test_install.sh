@@ -90,5 +90,30 @@ out2="$(HOME="$TMP" bash "$SCRIPT" 2>&1)"
 rc2=$?
 [[ $rc2 -eq 0 ]] && ok "install.sh is idempotent (second run exits 0)" || bad "install.sh is idempotent (second run rc=$rc2): $out2"
 
+# ---- Final fix wave: workspace CLAUDE.md, log/state dirs, user config ----
+T2="$(mktemp -d)"
+mkdir -p "$T2/lobster/config" "$T2/lobster-user-config/memory/canonical"
+printf 'TELEGRAM_BOT_TOKEN=secret\nTELEGRAM_ALLOWED_USERS=12345,678\n' > "$T2/lobster/config/config.env"
+printf 'handoff\n' > "$T2/lobster-user-config/memory/canonical/handoff.md"
+out3="$(HOME="$T2" bash "$SCRIPT" 2>&1)"; rc3=$?
+[[ $rc3 -eq 0 ]] && ok "install.sh exits 0 with config + old user config present" || bad "install rc=$rc3: $out3"
+wsmd="$T2/lobster-workspace/CLAUDE.md"
+if [[ -f "$wsmd" ]] && grep -qF "~/lobster/CLAUDE.md" "$wsmd" && grep -qF "~/lobster/.claude/sys.dispatcher.bootup.md" "$wsmd"; then
+    ok "workspace CLAUDE.md points at Lobster's CLAUDE.md and dispatcher bootup"
+else
+    bad "workspace CLAUDE.md: $(cat "$wsmd" 2>&1)"
+fi
+grep -qx "ADMIN_CHAT_ID=12345" "$wsmd" 2>/dev/null && ok "workspace CLAUDE.md carries ADMIN_CHAT_ID" || bad "ADMIN_CHAT_ID missing: $(cat "$wsmd" 2>&1)"
+grep -q "secret" "$wsmd" 2>/dev/null && bad "workspace CLAUDE.md leaked a secret" || ok "workspace CLAUDE.md has no secrets"
+logd="$T2/.local/state/clawdaddy/logs"
+[[ -d "$logd" && "$(stat -f %Lp "$logd")" == "700" ]] && ok "log dir exists, mode 700" || bad "log dir: $(ls -ld "$logd" 2>&1)"
+[[ -f "$T2/lobster-workspace/user-config/memory/canonical/handoff.md" ]] && ok "old user config moved into the workspace" || bad "user config not moved"
+[[ -d "$T2/lobster-user-config" && ! -e "$T2/lobster-user-config/memory" ]] && ok "old user-config dir left in place, emptied" || bad "old user-config dir state: $(find "$T2/lobster-user-config" 2>&1)"
+[[ ! -e "$T2/lobster-workspace/logs" ]] && ok "no logs dir created in the workspace" || bad "workspace logs dir created"
+printf 'my own notes\n' > "$wsmd"
+HOME="$T2" bash "$SCRIPT" >/dev/null 2>&1
+[[ "$(cat "$wsmd")" == "my own notes" ]] && ok "a hand-written workspace CLAUDE.md is never overwritten" || bad "overwrote hand-written CLAUDE.md"
+rm -rf "$T2"
+
 echo "passed=$PASS failed=$FAIL"
 [[ $FAIL -eq 0 ]]
