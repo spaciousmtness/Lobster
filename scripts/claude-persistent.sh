@@ -47,8 +47,14 @@ WORKSPACE_DIR="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
 INSTALL_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
 MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
 STATE_FILE="$MESSAGES_DIR/config/lobster-state.json"
-LOG_DIR="$WORKSPACE_DIR/logs"
+# LOBSTER_LOG_DIR (the Mac sets it outside the workspace, in
+# ~/.local/state/clawdaddy/logs) holds the launcher's logs and the dispatcher
+# startup flag. The agent can write the workspace, so a log there could be
+# swapped for a symlink and turn this script's appends into writes anywhere.
+# Unset (Linux), everything stays where it always was.
+LOG_DIR="${LOBSTER_LOG_DIR:-$WORKSPACE_DIR/logs}"
 LOG_FILE="$LOG_DIR/claude-persistent.log"
+STARTUP_FLAG_DIR="${LOBSTER_LOG_DIR:-$WORKSPACE_DIR/data}"
 
 # Auth failure tracking
 AUTH_FAIL_COUNT=0
@@ -142,7 +148,7 @@ write_boot_stamp() {
     # If state file already exists, merge booted_at in without losing other fields.
     # Fall back to writing a minimal JSON if the file is absent or unreadable.
     if [[ -f "$STATE_FILE" ]]; then
-        python3 -c "
+        python3 -I -c "
 import json, sys
 path = '$STATE_FILE'
 now = '$now'
@@ -172,7 +178,7 @@ EOF
 
 read_state_mode() {
     if [[ -f "$STATE_FILE" ]]; then
-        python3 -c "
+        python3 -I -c "
 import json, sys
 try:
     d = json.load(open('$STATE_FILE'))
@@ -217,7 +223,7 @@ find_session_to_resume() {
     # claude -r picks up the last session, but we can also check state
     local last_session=""
     if [[ -f "$STATE_FILE" ]]; then
-        last_session=$(python3 -c "
+        last_session=$(python3 -I -c "
 import json
 try:
     d = json.load(open('$STATE_FILE'))
@@ -508,7 +514,9 @@ launch_claude() {
     write_state "starting" "attempt=$attempt"
     log "STARTING: Launching Claude (attempt $attempt)"
 
-    cd "$WORKSPACE_DIR"
+    # The cd into the workspace happens only in the subshell that execs
+    # claude (below): the launcher itself runs python3 and other tools, and
+    # none of them should start in a folder the agent can write.
 
     # -------------------------------------------------------------------------
     # Kill orphaned claude processes from prior sessions before launching a new one.
@@ -636,8 +644,9 @@ launch_claude() {
         # present when SessionStart fires. inject-bootup-context.py reads the
         # flag, verifies the PID is alive via kill -0, consumes the flag, and
         # injects dispatcher bootup context. Stale flags (dead PID) are ignored.
-        mkdir -p "$WORKSPACE_DIR/data"
-        echo "$BASHPID" > "$WORKSPACE_DIR/data/dispatcher-startup-flag"
+        mkdir -p "$STARTUP_FLAG_DIR"
+        echo "$BASHPID" > "$STARTUP_FLAG_DIR/dispatcher-startup-flag"
+        cd "$WORKSPACE_DIR" || exit 1
         exec_claude_dispatcher "$init_prompt"
     ) 2>&1 | tee -a "$LOG_DIR/claude-session.log" || claude_exit_code=$?
 
@@ -677,7 +686,7 @@ handle_exit() {
             now=$(date -Iseconds)
             local tmp_state
             tmp_state=$(mktemp "${STATE_FILE}.tmp.XXXXXX")
-            python3 -c "
+            python3 -I -c "
 import json
 path = '$STATE_FILE'
 now = '$now'
