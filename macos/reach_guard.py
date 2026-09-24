@@ -664,7 +664,7 @@ def main() -> None:
         messages = Path(
             os.environ.get("LOBSTER_MESSAGES", str(home / "messages"))
         ).expanduser()
-        approvals_path = home / ".local" / "state" / "clawdaddy" / "approvals.json"
+        approvals_path = approvals.DEFAULT_PATH
 
         decision, reason = decide(
             tool_name,

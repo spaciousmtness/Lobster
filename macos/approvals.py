@@ -29,6 +29,12 @@ from pathlib import Path
 
 TTL = 600  # seconds a grant stays valid before it expires unused
 
+# The one real approvals file every piece of Clawdaddy agrees on: the reach
+# guard consumes grants from it, and ask_melissa (macos/approval_server.py)
+# writes them here on an "approved" button press. Kept as a single public
+# constant so no caller has to duplicate the path.
+DEFAULT_PATH = Path.home() / ".local" / "state" / "clawdaddy" / "approvals.json"
+
 
 def key(tool_name: str, tool_input: dict) -> str:
     """Canonical key for one tool call: sha256(tool_name + "\\n" + sorted json)."""
