@@ -20,7 +20,7 @@ import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -38,6 +38,7 @@ from integrations.google_calendar.oauth import (
     OAuthTokenError,
     TokenData,
 )
+from integrations.google_calendar import token_store as ts
 from integrations.google_calendar.token_store import (
     _dict_to_token,
     _token_path,
@@ -52,7 +53,7 @@ from integrations.google_calendar.token_store import (
 # ---------------------------------------------------------------------------
 
 _FAKE_CLIENT_ID = "fake-client-id.apps.googleusercontent.com"
-_FAKE_CLIENT_SECRET = "fake-client-secret"
+_FAKE_CLIENT_SECRET = "<REDACTED_SECRET>"
 _FAKE_REDIRECT_URI = "https://myownlobster.ai/auth/google/callback"
 _FAKE_CREDENTIALS = GoogleOAuthCredentials(
     client_id=_FAKE_CLIENT_ID,
@@ -61,8 +62,8 @@ _FAKE_CREDENTIALS = GoogleOAuthCredentials(
     redirect_uri=_FAKE_REDIRECT_URI,
 )
 
-_FAKE_ACCESS_TOKEN = "ya29.fake-access-token"
-_FAKE_REFRESH_TOKEN = "1//fake-refresh-token"
+_FAKE_ACCESS_TOKEN = "<REDACTED_SECRET>"
+_FAKE_REFRESH_TOKEN = "<REDACTED_SECRET>"
 _FAKE_SCOPE = f"{SCOPE_READONLY} {SCOPE_EVENTS}"
 
 _FUTURE_EXPIRES = datetime(2099, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -304,14 +305,14 @@ class TestSaveToken:
         save_token("user1", token_a, token_dir=tmp_path)
         # Save a different token — access_token differs
         token_b = TokenData(
-            access_token="ya29.different-token",
+            access_token="<REDACTED_SECRET>",
             expires_at=_FUTURE_EXPIRES,
             scope=_FAKE_SCOPE,
             refresh_token=_FAKE_REFRESH_TOKEN,
         )
         save_token("user1", token_b, token_dir=tmp_path)
         data = json.loads((tmp_path / "user1.json").read_text())
-        assert data["access_token"] == "ya29.different-token"
+        assert data["access_token"] == "<REDACTED_SECRET>"
 
     def test_creates_token_dir_if_absent(self, tmp_path: Path) -> None:
         nested = tmp_path / "a" / "b" / "c"
@@ -404,6 +405,14 @@ class TestLoadToken:
 
 # ---------------------------------------------------------------------------
 # get_valid_token
+#
+# NOTE: The token_store module was refactored to use a myownlobster.ai proxy for
+# token refresh instead of calling the Google OAuth API directly.  The old
+# `refresh_access_token` function (from oauth.py) is no longer called from
+# token_store.py.  The internal helper is now `_refresh_token_via_proxy`.
+# Tests that previously patched `refresh_access_token` now patch
+# `_refresh_token_via_proxy` instead.  The `credentials` kwarg to
+# `get_valid_token` is still accepted (for API compatibility) but is ignored.
 # ---------------------------------------------------------------------------
 
 
@@ -423,19 +432,18 @@ class TestGetValidToken:
         expired = _make_expired_token()
         save_token("user1", expired, token_dir=tmp_path)
         new_access = "ya29.refreshed-access-token"
-        refreshed_token = TokenData(
+        # The proxy returns a partial TokenData (no refresh_token, scope="")
+        proxy_result = TokenData(
             access_token=new_access,
             expires_at=_FUTURE_EXPIRES,
-            scope=_FAKE_SCOPE,
-            refresh_token=None,  # Google often omits this
+            scope="",
+            refresh_token=None,
         )
         with patch(
-            "integrations.google_calendar.token_store.refresh_access_token",
-            return_value=refreshed_token,
+            "integrations.google_calendar.token_store._refresh_token_via_proxy",
+            return_value=proxy_result,
         ):
-            result = get_valid_token(
-                "user1", token_dir=tmp_path, credentials=_FAKE_CREDENTIALS
-            )
+            result = get_valid_token("user1", token_dir=tmp_path)
         assert result is not None
         assert result.access_token == new_access
 
@@ -443,17 +451,17 @@ class TestGetValidToken:
         expired = _make_expired_token()
         save_token("user1", expired, token_dir=tmp_path)
         new_access = "ya29.refreshed-token"
-        refreshed_token = TokenData(
+        proxy_result = TokenData(
             access_token=new_access,
             expires_at=_FUTURE_EXPIRES,
-            scope=_FAKE_SCOPE,
+            scope="",
             refresh_token=None,
         )
         with patch(
-            "integrations.google_calendar.token_store.refresh_access_token",
-            return_value=refreshed_token,
+            "integrations.google_calendar.token_store._refresh_token_via_proxy",
+            return_value=proxy_result,
         ):
-            get_valid_token("user1", token_dir=tmp_path, credentials=_FAKE_CREDENTIALS)
+            get_valid_token("user1", token_dir=tmp_path)
         # Now load directly from disk to confirm it was persisted
         stored = load_token("user1", token_dir=tmp_path)
         assert stored is not None
@@ -463,45 +471,30 @@ class TestGetValidToken:
         original_refresh = "1//original-refresh-token"
         expired = _make_expired_token(refresh_token=original_refresh)
         save_token("user1", expired, token_dir=tmp_path)
-        # Refreshed response has no refresh_token
-        refreshed_token = TokenData(
-            access_token="ya29.new-access",
+        # Proxy response has no refresh_token; get_valid_token must preserve the original
+        proxy_result = TokenData(
+            access_token="<REDACTED_SECRET>",
             expires_at=_FUTURE_EXPIRES,
-            scope=_FAKE_SCOPE,
+            scope="",
             refresh_token=None,
         )
         with patch(
-            "integrations.google_calendar.token_store.refresh_access_token",
-            return_value=refreshed_token,
+            "integrations.google_calendar.token_store._refresh_token_via_proxy",
+            return_value=proxy_result,
         ):
-            result = get_valid_token(
-                "user1", token_dir=tmp_path, credentials=_FAKE_CREDENTIALS
-            )
+            result = get_valid_token("user1", token_dir=tmp_path)
         assert result is not None
         assert result.refresh_token == original_refresh
 
-    def test_returns_none_when_refresh_fails_with_oauth_error(self, tmp_path: Path) -> None:
+    def test_returns_none_when_refresh_proxy_returns_none(self, tmp_path: Path) -> None:
+        """When the refresh proxy returns None (any failure), get_valid_token returns None."""
         expired = _make_expired_token()
         save_token("user1", expired, token_dir=tmp_path)
         with patch(
-            "integrations.google_calendar.token_store.refresh_access_token",
-            side_effect=OAuthTokenError("invalid_grant", "Token revoked."),
+            "integrations.google_calendar.token_store._refresh_token_via_proxy",
+            return_value=None,
         ):
-            result = get_valid_token(
-                "user1", token_dir=tmp_path, credentials=_FAKE_CREDENTIALS
-            )
-        assert result is None
-
-    def test_returns_none_when_refresh_fails_with_network_error(self, tmp_path: Path) -> None:
-        expired = _make_expired_token()
-        save_token("user1", expired, token_dir=tmp_path)
-        with patch(
-            "integrations.google_calendar.token_store.refresh_access_token",
-            side_effect=OAuthNetworkError("timeout"),
-        ):
-            result = get_valid_token(
-                "user1", token_dir=tmp_path, credentials=_FAKE_CREDENTIALS
-            )
+            result = get_valid_token("user1", token_dir=tmp_path)
         assert result is None
 
     def test_returns_none_when_token_expired_and_no_refresh_token(
@@ -516,25 +509,455 @@ class TestGetValidToken:
         valid = _make_valid_token()
         save_token("user1", valid, token_dir=tmp_path)
         with patch(
-            "integrations.google_calendar.token_store.refresh_access_token",
-        ) as mock_refresh:
+            "integrations.google_calendar.token_store._refresh_token_via_proxy",
+        ) as mock_proxy:
             get_valid_token("user1", token_dir=tmp_path)
-        mock_refresh.assert_not_called()
+        mock_proxy.assert_not_called()
 
-    def test_passes_credentials_to_refresh(self, tmp_path: Path) -> None:
-        expired = _make_expired_token()
+    def test_proxy_called_with_refresh_token(self, tmp_path: Path) -> None:
+        """The proxy is called with the stored refresh_token string."""
+        expired = _make_expired_token(refresh_token=_FAKE_REFRESH_TOKEN)
         save_token("user1", expired, token_dir=tmp_path)
-        refreshed = TokenData(
-            access_token="ya29.new",
+        proxy_result = TokenData(
+            access_token="<REDACTED_SECRET>",
             expires_at=_FUTURE_EXPIRES,
-            scope=_FAKE_SCOPE,
+            scope="",
+            refresh_token=None,
         )
         with patch(
-            "integrations.google_calendar.token_store.refresh_access_token",
-            return_value=refreshed,
-        ) as mock_refresh:
-            get_valid_token(
-                "user1", token_dir=tmp_path, credentials=_FAKE_CREDENTIALS
+            "integrations.google_calendar.token_store._refresh_token_via_proxy",
+            return_value=proxy_result,
+        ) as mock_proxy:
+            get_valid_token("user1", token_dir=tmp_path)
+        mock_proxy.assert_called_once_with(_FAKE_REFRESH_TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# get_valid_token — workspace-token fallback (BIS-731 / Slice 3)
+#
+# A user who ran the `workspace` consent flow already holds a token whose
+# scope bundle includes the full-access calendar scope "for unified-token
+# support" (google_workspace/config.py WORKSPACE_SCOPES). If this module's
+# own gcal-tokens/<chat_id>.json file doesn't exist, get_valid_token should
+# fall back to that workspace token — but only when the workspace token's
+# granted scope actually contains the calendar scope. If the scope-specific
+# file DOES exist, the workspace store must never even be consulted.
+# ---------------------------------------------------------------------------
+
+from integrations.google_workspace.token_store import save_token as _save_workspace_token
+
+_WORKSPACE_SCOPE_WITH_CALENDAR = (
+    "https://www.googleapis.com/auth/documents "
+    "https://www.googleapis.com/auth/drive "
+    "https://www.googleapis.com/auth/drive.file "
+    "https://www.googleapis.com/auth/spreadsheets "
+    "https://www.googleapis.com/auth/gmail.modify "
+    "https://www.googleapis.com/auth/calendar"
+)
+
+_WORKSPACE_SCOPE_WITHOUT_CALENDAR = (
+    "https://www.googleapis.com/auth/documents "
+    "https://www.googleapis.com/auth/spreadsheets"
+)
+
+
+def _make_workspace_token(
+    scope: str, refresh_token: str | None = "workspace-refresh-token"
+) -> TokenData:
+    return TokenData(
+        access_token="workspace-access-token",
+        expires_at=_FUTURE_EXPIRES,
+        scope=scope,
+        refresh_token=refresh_token,
+    )
+
+
+class TestGetValidTokenWorkspaceFallback:
+    def test_falls_back_to_workspace_token_when_own_file_absent(
+        self, tmp_path: Path
+    ) -> None:
+        own_dir = tmp_path / "gcal-tokens"
+        workspace_dir = tmp_path / "workspace-tokens"
+        _save_workspace_token(
+            "user1",
+            _make_workspace_token(_WORKSPACE_SCOPE_WITH_CALENDAR),
+            token_dir=workspace_dir,
+        )
+
+        result = get_valid_token(
+            "user1", token_dir=own_dir, workspace_token_dir=workspace_dir
+        )
+
+        assert result is not None
+        assert result.access_token == "workspace-access-token"
+
+    def test_workspace_fallback_rejected_when_scope_lacks_calendar(
+        self, tmp_path: Path
+    ) -> None:
+        own_dir = tmp_path / "gcal-tokens"
+        workspace_dir = tmp_path / "workspace-tokens"
+        _save_workspace_token(
+            "user1",
+            _make_workspace_token(_WORKSPACE_SCOPE_WITHOUT_CALENDAR),
+            token_dir=workspace_dir,
+        )
+
+        result = get_valid_token(
+            "user1", token_dir=own_dir, workspace_token_dir=workspace_dir
+        )
+
+        assert result is None
+
+    def test_own_token_wins_and_workspace_is_never_consulted(
+        self, tmp_path: Path
+    ) -> None:
+        own_dir = tmp_path / "gcal-tokens"
+        workspace_dir = tmp_path / "workspace-tokens"
+        own_token = _make_valid_token()
+        save_token("user1", own_token, token_dir=own_dir)
+
+        # A deliberately different/invalid workspace token sits alongside a
+        # valid own token — if the own token weren't checked first, this
+        # would either win or blow up on the corrupt JSON.
+        workspace_dir.mkdir(parents=True)
+        (workspace_dir / "user1.json").write_text("{ not valid json }")
+
+        with patch(f"{ts.__name__}._get_workspace_fallback_token") as mock_fallback:
+            result = get_valid_token(
+                "user1", token_dir=own_dir, workspace_token_dir=workspace_dir
             )
-        _, kwargs = mock_refresh.call_args
-        assert kwargs.get("credentials") == _FAKE_CREDENTIALS
+
+        mock_fallback.assert_not_called()
+        assert result is not None
+        assert result.access_token == own_token.access_token
+
+    def test_returns_none_when_neither_own_nor_workspace_token_exists(
+        self, tmp_path: Path
+    ) -> None:
+        own_dir = tmp_path / "gcal-tokens"
+        workspace_dir = tmp_path / "workspace-tokens"
+
+        result = get_valid_token(
+            "user1", token_dir=own_dir, workspace_token_dir=workspace_dir
+        )
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _internal_auth_header (BIS-728 / Slice 0 characterization)
+#
+# Today this is the ONLY authentication the refresh proxy call carries: a
+# static bearer secret read from LOBSTER_INTERNAL_SECRET. There is no
+# per-request signing. Pinning this exactly so Slice 1+ can prove what
+# changed on the refresh-proxy call path (if anything).
+# ---------------------------------------------------------------------------
+
+
+class TestInternalAuthHeader:
+    def test_raises_runtime_error_when_secret_unset(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(RuntimeError, match="LOBSTER_INTERNAL_SECRET"):
+                ts._internal_auth_header()
+
+    def test_raises_runtime_error_when_secret_empty_string(self) -> None:
+        with patch.dict(os.environ, {"LOBSTER_INTERNAL_SECRET": ""}, clear=True):
+            with pytest.raises(RuntimeError, match="LOBSTER_INTERNAL_SECRET"):
+                ts._internal_auth_header()
+
+    def test_raises_runtime_error_when_secret_whitespace_only(self) -> None:
+        with patch.dict(os.environ, {"LOBSTER_INTERNAL_SECRET": "   "}, clear=True):
+            with pytest.raises(RuntimeError, match="LOBSTER_INTERNAL_SECRET"):
+                ts._internal_auth_header()
+
+    def test_returns_bearer_header_with_static_secret(self) -> None:
+        with patch.dict(os.environ, {"LOBSTER_INTERNAL_SECRET": "my-secret"}, clear=True):
+            header = ts._internal_auth_header()
+        assert header == {"Authorization": "Bearer my-secret"}
+
+    def test_strips_surrounding_whitespace_from_secret(self) -> None:
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "  my-secret  "}, clear=True
+        ):
+            header = ts._internal_auth_header()
+        assert header == {"Authorization": "Bearer my-secret"}
+
+
+# ---------------------------------------------------------------------------
+# _load_calendar_config / _myownlobster_api_base (BIS-728 / Slice 0 characterization)
+# ---------------------------------------------------------------------------
+
+
+class TestCalendarConfigLoader:
+    def test_returns_empty_dict_when_config_file_absent(self, tmp_path: Path) -> None:
+        missing = tmp_path / "calendar-config.json"
+        with patch(f"{ts.__name__}._CALENDAR_CONFIG_PATH", missing):
+            result = ts._load_calendar_config()
+        assert result == {}
+
+    def test_returns_parsed_dict_when_config_present(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "calendar-config.json"
+        config_path.write_text(json.dumps({"myownlobster_api_base": "https://example.test"}))
+        with patch(f"{ts.__name__}._CALENDAR_CONFIG_PATH", config_path):
+            result = ts._load_calendar_config()
+        assert result == {"myownlobster_api_base": "https://example.test"}
+
+    def test_returns_empty_dict_on_malformed_json(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "calendar-config.json"
+        config_path.write_text("{ not valid json }")
+        with patch(f"{ts.__name__}._CALENDAR_CONFIG_PATH", config_path):
+            result = ts._load_calendar_config()
+        assert result == {}
+
+    def test_api_base_returns_default_when_config_absent(self, tmp_path: Path) -> None:
+        missing = tmp_path / "calendar-config.json"
+        with patch(f"{ts.__name__}._CALENDAR_CONFIG_PATH", missing):
+            result = ts._myownlobster_api_base()
+        assert result == "https://myownlobster.ai"
+
+    def test_api_base_returns_configured_value(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "calendar-config.json"
+        config_path.write_text(json.dumps({"myownlobster_api_base": "https://custom.example"}))
+        with patch(f"{ts.__name__}._CALENDAR_CONFIG_PATH", config_path):
+            result = ts._myownlobster_api_base()
+        assert result == "https://custom.example"
+
+    def test_api_base_strips_trailing_slash(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "calendar-config.json"
+        config_path.write_text(json.dumps({"myownlobster_api_base": "https://custom.example/"}))
+        with patch(f"{ts.__name__}._CALENDAR_CONFIG_PATH", config_path):
+            result = ts._myownlobster_api_base()
+        assert result == "https://custom.example"
+
+
+# ---------------------------------------------------------------------------
+# _refresh_token_via_proxy — HTTP side-effecting boundary
+# (BIS-728 / Slice 0 characterization; mirrors test_gmail_token_store.py's
+# TestRefreshTokenViaProxy, adapted for the calendar refresh endpoint)
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshTokenViaProxy:
+    def _mock_success_response(self) -> MagicMock:
+        resp = MagicMock()
+        resp.ok = True
+        resp.status_code = 200
+        resp.json.return_value = {
+            "access_token": "new-access-token",
+            "expires_in": 3600,
+        }
+        return resp
+
+    def test_returns_new_token_on_success(self) -> None:
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "secret"}, clear=True
+        ), patch(
+            "integrations.google_calendar.token_store.requests.post",
+            return_value=self._mock_success_response(),
+        ):
+            result = ts._refresh_token_via_proxy("refresh-tok")
+        assert result is not None
+        assert result.access_token == "new-access-token"
+        assert result.expires_at > datetime.now(tz=timezone.utc)
+
+    def test_new_token_has_empty_scope_and_no_refresh_token(self) -> None:
+        """The proxy response never carries scope or refresh_token — the
+        caller (get_valid_token) is responsible for merging those back in
+        from the on-disk record."""
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "secret"}, clear=True
+        ), patch(
+            "integrations.google_calendar.token_store.requests.post",
+            return_value=self._mock_success_response(),
+        ):
+            result = ts._refresh_token_via_proxy("refresh-tok")
+        assert result is not None
+        assert result.scope == ""
+        assert result.refresh_token is None
+
+    def test_returns_none_when_secret_missing(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            result = ts._refresh_token_via_proxy("refresh-tok")
+        assert result is None
+
+    def test_returns_none_on_network_error(self) -> None:
+        import requests as req_lib
+
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "secret"}, clear=True
+        ), patch(
+            "integrations.google_calendar.token_store.requests.post",
+            side_effect=req_lib.exceptions.ConnectionError("refused"),
+        ):
+            result = ts._refresh_token_via_proxy("refresh-tok")
+        assert result is None
+
+    def test_returns_none_on_non_ok_response(self) -> None:
+        bad = MagicMock()
+        bad.ok = False
+        bad.status_code = 500
+        bad.text = "Internal Server Error"
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "secret"}, clear=True
+        ), patch(
+            "integrations.google_calendar.token_store.requests.post",
+            return_value=bad,
+        ):
+            result = ts._refresh_token_via_proxy("refresh-tok")
+        assert result is None
+
+    def test_returns_none_on_bad_json(self) -> None:
+        resp = MagicMock()
+        resp.ok = True
+        resp.json.return_value = {"unexpected": "keys"}
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "secret"}, clear=True
+        ), patch(
+            "integrations.google_calendar.token_store.requests.post",
+            return_value=resp,
+        ):
+            result = ts._refresh_token_via_proxy("refresh-tok")
+        assert result is None
+
+    def test_uses_calendar_refresh_endpoint(self) -> None:
+        """Refresh must call the calendar-specific endpoint, not gmail's."""
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "secret"}, clear=True
+        ), patch(
+            "integrations.google_calendar.token_store.requests.post",
+            return_value=self._mock_success_response(),
+        ) as mock_post:
+            ts._refresh_token_via_proxy("refresh-tok")
+
+        called_url = mock_post.call_args.args[0]
+        assert called_url == "https://myownlobster.ai/api/internal/refresh-calendar-token"
+
+    def test_posts_refresh_token_in_json_body(self) -> None:
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "secret"}, clear=True
+        ), patch(
+            "integrations.google_calendar.token_store.requests.post",
+            return_value=self._mock_success_response(),
+        ) as mock_post:
+            ts._refresh_token_via_proxy("the-refresh-token")
+
+        assert mock_post.call_args.kwargs["json"] == {"refresh_token": "the-refresh-token"}
+
+    def test_sends_bearer_auth_header(self) -> None:
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "topsecret"}, clear=True
+        ), patch(
+            "integrations.google_calendar.token_store.requests.post",
+            return_value=self._mock_success_response(),
+        ) as mock_post:
+            ts._refresh_token_via_proxy("refresh-tok")
+
+        assert mock_post.call_args.kwargs["headers"] == {
+            "Authorization": "Bearer topsecret"
+        }
+
+    def test_uses_10_second_timeout(self) -> None:
+        with patch.dict(
+            os.environ, {"LOBSTER_INTERNAL_SECRET": "secret"}, clear=True
+        ), patch(
+            "integrations.google_calendar.token_store.requests.post",
+            return_value=self._mock_success_response(),
+        ) as mock_post:
+            ts._refresh_token_via_proxy("refresh-tok")
+
+        assert mock_post.call_args.kwargs["timeout"] == 10
+
+
+# ---------------------------------------------------------------------------
+# _save_token_local — atomic write cleanup on failure
+# (BIS-728 / Slice 0 characterization)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveTokenAtomicWriteFailure:
+    def test_tmp_file_removed_and_exception_propagates_on_rename_failure(
+        self, tmp_path: Path
+    ) -> None:
+        token = _make_valid_token()
+        with patch(
+            "integrations.google_calendar.token_store.os.rename",
+            side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError, match="disk full"):
+                save_token("user1", token, token_dir=tmp_path)
+        # The .tmp file must not be left behind after a failed write.
+        assert not (tmp_path / "user1.json.tmp").exists()
+        # And no final file should exist either, since rename never succeeded.
+        assert not (tmp_path / "user1.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Identity metadata (issue #2153) -- email captured at grant time survives
+# save/load and is preserved across a refresh.
+# ---------------------------------------------------------------------------
+
+
+class TestEmailIdentityMetadata:
+    def test_roundtrip_preserves_email(self, tmp_path):
+        token = TokenData(
+            access_token=_FAKE_ACCESS_TOKEN,
+            expires_at=_FUTURE_EXPIRES,
+            scope=_FAKE_SCOPE,
+            refresh_token=_FAKE_REFRESH_TOKEN,
+            email="account-a@example.com",
+        )
+        save_token("chat_a", token, token_dir=tmp_path)
+        loaded = load_token("chat_a", token_dir=tmp_path)
+        assert loaded.email == "account-a@example.com"
+
+    def test_missing_email_key_loads_as_none(self, tmp_path):
+        """Tokens saved before this field existed must still load cleanly."""
+        (tmp_path / "legacy_user.json").write_text(
+            json.dumps(
+                {
+                    "access_token": _FAKE_ACCESS_TOKEN,
+                    "expires_at": _FUTURE_EXPIRES.isoformat(),
+                    "scope": _FAKE_SCOPE,
+                    "refresh_token": _FAKE_REFRESH_TOKEN,
+                }
+            )
+        )
+        loaded = load_token("legacy_user", token_dir=tmp_path)
+        assert loaded is not None
+        assert loaded.email is None
+
+    def test_two_chat_ids_store_independent_emails(self, tmp_path):
+        """The exact scenario from the production incident: two different
+        chat_ids must each retain their OWN email, with no cross-contamination."""
+        token_a = TokenData(
+            access_token="tok-a", expires_at=_FUTURE_EXPIRES, scope=_FAKE_SCOPE,
+            refresh_token="r", email="account-a@example.com",
+        )
+        token_b = TokenData(
+            access_token="tok-b", expires_at=_FUTURE_EXPIRES, scope=_FAKE_SCOPE,
+            refresh_token="r", email="account-b@example.com",
+        )
+        save_token("1111111111", token_a, token_dir=tmp_path)
+        save_token("2222222222", token_b, token_dir=tmp_path)
+
+        assert load_token("1111111111", token_dir=tmp_path).email == "account-a@example.com"
+        assert load_token("2222222222", token_dir=tmp_path).email == "account-b@example.com"
+
+    def test_email_preserved_across_refresh(self, tmp_path):
+        expired = TokenData(
+            access_token="expired-tok", expires_at=_EXPIRED_EXPIRES, scope=_FAKE_SCOPE,
+            refresh_token="valid-refresh", email="account-a@example.com",
+        )
+        save_token("user_refresh_email", expired, token_dir=tmp_path)
+
+        refreshed_partial = TokenData(
+            access_token="refreshed-tok", expires_at=_FUTURE_EXPIRES, scope="", refresh_token=None,
+        )
+        with patch(
+            "integrations.google_calendar.token_store._refresh_token_via_proxy",
+            return_value=refreshed_partial,
+        ):
+            result = get_valid_token("user_refresh_email", token_dir=tmp_path)
+
+        assert result.email == "account-a@example.com"
+        assert load_token("user_refresh_email", token_dir=tmp_path).email == "account-a@example.com"

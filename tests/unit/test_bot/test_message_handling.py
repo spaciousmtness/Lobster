@@ -1,7 +1,15 @@
 """
 Tests for Telegram Bot Message Handling
 
-Tests text and voice message handling.
+Tests text and audio/voice message handling.
+
+Changes from original:
+- mock_update fixture now explicitly sets message.audio = None and
+  message.photo = None and message.document = None so MagicMock's auto-attribute
+  creation doesn't trick the `audio_obj = message.voice or message.audio` guard.
+- TestHandleVoiceMessage renamed to TestHandleAudioMessage; tests now call
+  handle_audio_message(update, context, msg_id, audio_obj) — the function that
+  replaced handle_voice_message after the audio handling refactor.
 """
 
 import json
@@ -24,7 +32,13 @@ class TestHandleMessage:
         update.message.message_id = 1
         update.message.chat_id = 123456
         update.message.text = "Hello, Lobster!"
+        # Explicitly null out all media fields so the audio/photo/document guards
+        # in handle_message don't fire when testing plain text handling.
         update.message.voice = None
+        update.message.audio = None
+        update.message.photo = None
+        update.message.document = None
+        update.message.reply_to_message = None
         update.message.reply_text = AsyncMock()
         return update
 
@@ -141,9 +155,63 @@ class TestHandleMessage:
                 call_args = mock_update.message.reply_text.call_args[0][0]
                 assert "received" in call_args.lower() or "processing" in call_args.lower()
 
+    @pytest.mark.asyncio
+    async def test_no_acknowledgment_in_group(
+        self, mock_update, mock_context, temp_messages_dir
+    ):
+        """Ack is suppressed for group messages to avoid cluttering group chat."""
+        inbox = temp_messages_dir / "inbox"
+        # Set up mock as a group message from an allowed user
+        mock_update.message.chat.type = "group"
+        mock_update.message.chat.id = -100123
+        mock_update.message.chat.title = "Test Group"
+        mock_update.message.chat_id = -100123
 
-class TestHandleVoiceMessage:
-    """Tests for voice message handling."""
+        from multiplayer_telegram_bot.gating import GatingResult, GatingAction
+
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_BOT_TOKEN": "test_token",
+                "TELEGRAM_ALLOWED_USERS": "123456",
+            },
+        ):
+            import importlib
+            import src.bot.lobster_bot as bot_module
+            importlib.reload(bot_module)
+
+            with (
+                patch.object(bot_module, "INBOX_DIR", inbox),
+                patch.object(bot_module, "_GROUP_GATING_ENABLED", True),
+                patch.object(
+                    bot_module,
+                    "gate_message",
+                    return_value=GatingResult(
+                        action=GatingAction.ALLOW,
+                        chat_id=-100123,
+                        user_id=123456,
+                        reason="allowed",
+                    ),
+                ),
+                patch.object(bot_module, "load_whitelist", return_value={}),
+            ):
+                await bot_module.handle_message(mock_update, mock_context)
+
+                # Message written to inbox
+                files = list(inbox.glob("*.json"))
+                assert len(files) == 1
+
+                # No ack reply in groups
+                mock_update.message.reply_text.assert_not_called()
+
+
+class TestHandleAudioMessage:
+    """Tests for handle_audio_message function.
+
+    The old handle_voice_message was folded into handle_audio_message, which
+    now accepts both telegram.Voice and telegram.Audio objects via a shared
+    audio_obj parameter.
+    """
 
     @pytest.fixture
     def mock_voice_update(self):
@@ -155,23 +223,31 @@ class TestHandleVoiceMessage:
         update.message.message_id = 1
         update.message.chat_id = 123456
         update.message.text = None
+        update.message.caption = None
+        # voice is non-None so is_voice = True in handle_audio_message
         update.message.voice = MagicMock()
         update.message.voice.file_id = "voice_file_123"
         update.message.voice.duration = 10
         update.message.voice.mime_type = "audio/ogg"
+        # MagicMock.file_name would auto-create a truthy MagicMock (not use the None
+        # default in getattr), making json.dumps fail. Explicitly set to None so that
+        # getattr(audio_obj, "file_name", None) falls through to the .ogg fallback.
+        update.message.voice.file_name = None
+        update.message.audio = None
         update.message.reply_text = AsyncMock()
+        # Prevent extract_reply_to_context from generating unserializable MagicMock values
+        update.message.reply_to_message = None
         return update
 
     @pytest.fixture
     def mock_context(self):
         """Create mock Context object with bot."""
         context = MagicMock()
-        context.bot.get_file = AsyncMock()
 
         # Create mock file object
         mock_file = MagicMock()
         mock_file.download_to_drive = AsyncMock()
-        context.bot.get_file.return_value = mock_file
+        context.bot.get_file = AsyncMock(return_value=mock_file)
 
         return context
 
@@ -179,9 +255,18 @@ class TestHandleVoiceMessage:
     async def test_voice_message_downloaded_and_saved(
         self, mock_voice_update, mock_context, temp_messages_dir
     ):
-        """Test that voice message is downloaded and metadata saved."""
+        """Test that voice message is downloaded and metadata saved to pending-transcription.
+
+        Voice messages must NOT land in inbox/ directly. They are routed to
+        pending-transcription/ so the transcription worker can enrich them with
+        a 'transcription' field before moving them to inbox/.  Agents only ever
+        see the transcribed message.
+        """
         inbox = temp_messages_dir / "inbox"
+        pending = temp_messages_dir / "pending-transcription"
+        pending.mkdir(parents=True, exist_ok=True)
         audio = temp_messages_dir / "audio"
+        audio.mkdir(parents=True, exist_ok=True)
 
         with patch.dict(
             os.environ,
@@ -196,19 +281,28 @@ class TestHandleVoiceMessage:
 
             with patch.object(bot_module, "INBOX_DIR", inbox):
                 with patch.object(bot_module, "AUDIO_DIR", audio):
-                    msg_id = "test_123"
-                    await bot_module.handle_voice_message(
-                        mock_voice_update, mock_context, msg_id
-                    )
+                    with patch.object(bot_module, "PENDING_TRANSCRIPTION_DIR", pending):
+                        msg_id = "test_123"
+                        # handle_audio_message requires an explicit audio_obj argument
+                        audio_obj = mock_voice_update.message.voice
+                        await bot_module.handle_audio_message(
+                            mock_voice_update, mock_context, msg_id, audio_obj
+                        )
 
-                    # Check that file was created in inbox
-                    files = list(inbox.glob("*.json"))
-                    assert len(files) == 1
+                        # Voice message must go to pending-transcription/, NOT inbox/
+                        inbox_files = list(inbox.glob("*.json"))
+                        assert len(inbox_files) == 0, (
+                            "Voice message must not be written to inbox/ directly; "
+                            "it should go to pending-transcription/ for auto-transcription"
+                        )
 
-                    content = json.loads(files[0].read_text())
-                    assert content["type"] == "voice"
-                    assert content["audio_duration"] == 10
-                    assert "audio_file" in content
+                        pending_files = list(pending.glob("*.json"))
+                        assert len(pending_files) == 1
+
+                        content = json.loads(pending_files[0].read_text())
+                        assert content["type"] == "voice"
+                        assert content["audio_duration"] == 10
+                        assert "audio_file" in content
 
     @pytest.mark.asyncio
     async def test_voice_message_sends_acknowledgment(
@@ -216,7 +310,10 @@ class TestHandleVoiceMessage:
     ):
         """Test that voice message acknowledgment is sent."""
         inbox = temp_messages_dir / "inbox"
+        pending = temp_messages_dir / "pending-transcription"
+        pending.mkdir(parents=True, exist_ok=True)
         audio = temp_messages_dir / "audio"
+        audio.mkdir(parents=True, exist_ok=True)
 
         with patch.dict(
             os.environ,
@@ -231,10 +328,12 @@ class TestHandleVoiceMessage:
 
             with patch.object(bot_module, "INBOX_DIR", inbox):
                 with patch.object(bot_module, "AUDIO_DIR", audio):
-                    await bot_module.handle_voice_message(
-                        mock_voice_update, mock_context, "test_123"
-                    )
+                    with patch.object(bot_module, "PENDING_TRANSCRIPTION_DIR", pending):
+                        audio_obj = mock_voice_update.message.voice
+                        await bot_module.handle_audio_message(
+                            mock_voice_update, mock_context, "test_123", audio_obj
+                        )
 
-                    mock_voice_update.message.reply_text.assert_called()
-                    call_args = mock_voice_update.message.reply_text.call_args[0][0]
-                    assert "voice" in call_args.lower() or "transcrib" in call_args.lower()
+                        mock_voice_update.message.reply_text.assert_called()
+                        call_args = mock_voice_update.message.reply_text.call_args[0][0]
+                        assert "voice" in call_args.lower() or "transcrib" in call_args.lower()

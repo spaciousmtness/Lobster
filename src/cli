@@ -32,30 +32,43 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # Directories
-INBOX_DIR="$HOME/messages/inbox"
-OUTBOX_DIR="$HOME/messages/outbox"
-PROCESSED_DIR="$HOME/messages/processed"
+MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
+INBOX_DIR="$MESSAGES_DIR/inbox"
+OUTBOX_DIR="$MESSAGES_DIR/outbox"
+PROCESSED_DIR="$MESSAGES_DIR/processed"
+MAINTENANCE_FLAG="$MESSAGES_DIR/config/lobster-maintenance"
 
 # Services
-SERVICES=("lobster-router" "lobster-claude")
+SERVICES=("lobster-mcp-local" "lobster-router" "lobster-claude")
 
 #-------------------------------------------------------------------------------
 # Helper Functions
 #-------------------------------------------------------------------------------
 
 print_header() {
-    echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║  $1$(printf '%*s' $((53 - ${#1})) '')║${NC}"
-    echo -e "${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BLUE}\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557${NC}"
+    echo -e "${BLUE}\u2551  $1$(printf '%*s' $((53 - ${#1})) '')\u2551${NC}"
+    echo -e "${BLUE}\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d${NC}"
 }
 
 service_status() {
     local service=$1
     if systemctl is-active --quiet "$service" 2>/dev/null; then
-        echo -e "${GREEN}●${NC} $service: ${GREEN}running${NC}"
+        # lobster-claude uses RemainAfterExit=yes, so the service stays "active"
+        # even after the tmux session dies. Check tmux explicitly.
+        if [[ "$service" == "lobster-claude" ]]; then
+            if tmux -L lobster has-session -t lobster 2>/dev/null; then
+                echo -e "${GREEN}\u25cf${NC} $service: ${GREEN}running${NC} (tmux session alive)"
+                return 0
+            else
+                echo -e "${YELLOW}\u25cf${NC} $service: ${YELLOW}service active, tmux session MISSING${NC} \u26a0"
+                return 1
+            fi
+        fi
+        echo -e "${GREEN}\u25cf${NC} $service: ${GREEN}running${NC}"
         return 0
     else
-        echo -e "${RED}○${NC} $service: ${RED}stopped${NC}"
+        echo -e "${RED}\u25cb${NC} $service: ${RED}stopped${NC}"
         return 1
     fi
 }
@@ -71,6 +84,12 @@ count_files() {
 
 cmd_start() {
     print_header "Starting Lobster"
+
+    # Clear maintenance mode flag if present
+    if [[ -f "$MAINTENANCE_FLAG" ]]; then
+        rm -f "$MAINTENANCE_FLAG"
+        echo -e "Maintenance mode cleared"
+    fi
 
     for service in "${SERVICES[@]}"; do
         echo -n "Starting $service... "
@@ -97,17 +116,94 @@ cmd_stop() {
             echo -e "${YELLOW}not running${NC}"
         fi
     done
+
+    # Kill any stale wrapper processes that may be running outside of systemd
+    # (e.g. after a manual mode switch between debug and non-debug sessions)
+    pkill -u lobster -f 'claude-persistent.sh' 2>/dev/null || true
+    pkill -u lobster -f 'claude-wrapper.exp' 2>/dev/null || true
+
+    # Clear the dispatcher session ID marker so the next SessionStart hook
+    # recognises the new dispatcher session as fresh rather than treating it as
+    # a subagent for the ~25-minute window before transcript evidence accumulates.
+    # Guard against MESSAGES_DIR being empty to avoid targeting /config/dispatcher-session-id.
+    if [[ -n "$MESSAGES_DIR" ]]; then
+        local dispatcher_session_file="$MESSAGES_DIR/config/dispatcher-session-id"
+        if [[ -f "$dispatcher_session_file" ]]; then
+            rm -f "$dispatcher_session_file"
+            echo -e "Dispatcher session marker cleared"
+        fi
+    fi
+
+    # Set maintenance flag so health check doesn't restart services
+    mkdir -p "$(dirname "$MAINTENANCE_FLAG")"
+    echo "stopped_at=$(date -Iseconds) stopped_by=$(whoami)" > "$MAINTENANCE_FLAG"
+    echo -e "${GREEN}Maintenance mode enabled${NC} (health check will not restart services)"
 }
 
 cmd_restart() {
     print_header "Restarting Lobster"
-    cmd_stop
-    sleep 1
-    cmd_start
+
+    # Schedule the start as a detached systemd transient unit BEFORE stopping.
+    # This is necessary because lobster-claude runs inside the very tmux session
+    # that `systemctl stop lobster-claude` will kill — so cmd_stop would destroy
+    # this process before cmd_start ever ran.
+    #
+    # systemd-run schedules a oneshot unit that fires 2 seconds after now,
+    # completely independent of the calling process. The delay gives the stop
+    # time to complete cleanly before the start fires.
+    #
+    # Note: we do NOT write the maintenance flag here. cmd_stop writes it to
+    # tell the health check "don't auto-restart, I intentionally stopped this".
+    # During a restart that flag is wrong — we WANT the services back up.
+    # cmd_start already removes the flag, but only if it runs; by scheduling
+    # start before stop we guarantee it runs even if this process dies.
+    # Clear any failed state from a previous lobster-restart-oneshot unit.
+    # systemd-run rejects a new transient unit with the same name if a prior
+    # instance is still in failed/loaded state. Without this, the restart
+    # silently stops services but never starts them.
+    sudo systemctl reset-failed lobster-restart-oneshot.service 2>/dev/null || true
+
+    echo "Scheduling start via systemd-run in 2s..."
+    if ! sudo systemd-run --system --on-active=2s --unit=lobster-restart-oneshot \
+            /bin/bash -c "rm -f '${MAINTENANCE_FLAG}'; systemctl start lobster-mcp-local lobster-router lobster-claude" \
+            2>/dev/null; then
+        echo -e "${RED}systemd-run failed — falling back to stop+start${NC}"
+        echo -e "${YELLOW}Warning: if running inside lobster-claude, the start may not execute.${NC}"
+        cmd_stop
+        sleep 1
+        cmd_start
+        return
+    fi
+
+    # Stop services without writing the maintenance flag.
+    # (We stop directly rather than calling cmd_stop so the flag is not set.)
+    echo "Stopping services..."
+    for service in "${SERVICES[@]}"; do
+        echo -n "Stopping $service... "
+        if sudo systemctl stop "$service" 2>/dev/null; then
+            echo -e "${GREEN}OK${NC}"
+        else
+            echo -e "${YELLOW}not running${NC}"
+        fi
+    done
+
+    # Clear dispatcher session ID so the next start is recognised as a fresh
+    # dispatcher (same reasoning as in cmd_stop).
+    # Guard against MESSAGES_DIR being empty to avoid targeting /config/dispatcher-session-id.
+    [[ -n "$MESSAGES_DIR" ]] && rm -f "$MESSAGES_DIR/config/dispatcher-session-id" 2>/dev/null || true
+
+    echo ""
+    echo -e "${GREEN}Services stopped. Start scheduled in ~2s (lobster-restart-oneshot).${NC}"
+    echo "Check status with: lobster status"
 }
 
 cmd_status() {
     print_header "Lobster Status"
+
+    if [[ -f "$MAINTENANCE_FLAG" ]]; then
+        echo ""
+        echo -e "${YELLOW}[!!] MAINTENANCE MODE - health check auto-restart disabled${NC}"
+    fi
 
     echo ""
     echo -e "${CYAN}Services:${NC}"
@@ -134,9 +230,9 @@ cmd_status() {
 
     echo ""
     if $all_running; then
-        echo -e "${GREEN}✓ Lobster is operational${NC}"
+        echo -e "${GREEN}\u2713 Lobster is operational${NC}"
     else
-        echo -e "${YELLOW}⚠ Some services are not running${NC}"
+        echo -e "${YELLOW}\u26a0 Some services are not running${NC}"
     fi
 }
 
@@ -182,9 +278,9 @@ cmd_inbox() {
     local count=$(count_files "$INBOX_DIR")
 
     if [ "$count" -eq 0 ]; then
-        echo -e "${GREEN}📭 Inbox is empty${NC}"
+        echo -e "${GREEN}[empty] Inbox is empty${NC}"
     else
-        echo -e "${YELLOW}📬 $count message(s) pending:${NC}"
+        echo -e "${YELLOW}[mail] $count message(s) pending:${NC}"
         echo ""
         for f in "$INBOX_DIR"/*.json; do
             if [ -f "$f" ]; then
@@ -204,16 +300,16 @@ cmd_outbox() {
     local count=$(count_files "$OUTBOX_DIR")
 
     if [ "$count" -eq 0 ]; then
-        echo -e "${GREEN}📤 Outbox is empty${NC}"
+        echo -e "${GREEN}[sent] Outbox is empty${NC}"
     else
-        echo -e "${YELLOW}📤 $count reply(s) queued:${NC}"
+        echo -e "${YELLOW}[send] $count reply(s) queued:${NC}"
         echo ""
         for f in "$OUTBOX_DIR"/*.json; do
             if [ -f "$f" ]; then
                 local source=$(jq -r '.source // "unknown"' "$f" 2>/dev/null)
                 local chat_id=$(jq -r '.chat_id // "?"' "$f" 2>/dev/null)
                 local text=$(jq -r '.text // "(no text)"' "$f" 2>/dev/null | head -c 60)
-                echo -e "  ${CYAN}[$source]${NC} → $chat_id: $text"
+                echo -e "  ${CYAN}[$source]${NC} -> $chat_id: $text"
             fi
         done
     fi
@@ -240,7 +336,7 @@ cmd_stats() {
 
     echo ""
     echo -e "${CYAN}Recent Activity:${NC}"
-    sudo journalctl -u lobster-claude --since "1 hour ago" --no-pager 2>/dev/null | \
+    sudo -n journalctl -u lobster-claude --since "1 hour ago" --no-pager 2>/dev/null | \
         grep -E "message|processed|reply" | tail -5 | sed 's/^/  /' || echo "  (no recent activity)"
 }
 
@@ -255,7 +351,8 @@ cmd_test() {
     cat > "$msg_file" << EOF
 {
   "id": "$msg_id",
-  "source": "test",
+  "source": "system",
+  "type": "self_check",
   "chat_id": 0,
   "user_id": 0,
   "username": "test_user",
@@ -265,7 +362,7 @@ cmd_test() {
 }
 EOF
 
-    echo -e "${GREEN}✓ Test message created: $msg_file${NC}"
+    echo -e "${GREEN}[ok] Test message created: $msg_file${NC}"
     echo ""
     echo "If Claude is running, it should process this shortly."
     echo "Watch with: lobster attach"
@@ -311,11 +408,11 @@ cmd_ps() {
         if echo "$cmd" | grep -q -- '--max-turns'; then
             role="scheduled"
         fi
-        # Check if parent is run-job.sh
+        # Check if parent is dispatch-job.sh
         local ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
         if [ -n "$ppid" ]; then
             local parent_cmd=$(ps -o args= -p "$ppid" 2>/dev/null || true)
-            if echo "$parent_cmd" | grep -q 'run-job.sh'; then
+            if echo "$parent_cmd" | grep -qE 'run-job.sh|dispatch-job.sh'; then
                 role="scheduled"
             fi
         fi
@@ -347,7 +444,7 @@ cmd_ps() {
         uptimes+=("$uptime_str")
         cmds+=("$cmd_short")
         count=$((count + 1))
-    done < <(ps aux | awk '$11 ~ /(^|\/)claude$/' | grep -v "lobster ps\|lobster ps")
+    done < <(ps aux | awk '$11 ~ /(^\/\/)claude$/' | grep -v "lobster ps\|lobster ps")
 
     if [ "$count" -eq 0 ]; then
         echo -e "  ${YELLOW}No Claude instances running${NC}"
@@ -370,20 +467,108 @@ cmd_ps() {
 }
 
 cmd_env() {
-    local install_dir="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
-    local env_script="$install_dir/scripts/lobster-env.sh"
+    # LOBSTER_CONFIG_DIR holds service-critical config (config.env).
+    # Default matches install.sh: $HOME/lobster-config.
+    # Previously this defaulted to lobster-user-config, which caused lobster env set
+    # to write to a directory the services never read. (#1454)
+    # global.env was the secondary token store prior to issue #1785; config.env is now
+    # the single canonical file for all credentials and configuration.
+    local config_dir="${LOBSTER_CONFIG_DIR:-$HOME/lobster-config}"
+    local env_file="$config_dir/config.env"
+    local legacy_global_env="$config_dir/global.env"
+    local subcmd="${1:-}"
 
-    if [ ! -f "$env_script" ]; then
-        echo -e "${RED}Error: lobster-env script not found at $env_script${NC}"
-        exit 1
-    fi
+    case "$subcmd" in
+        set)
+            local key="$2"
+            local value="$3"
+            if [ -z "$key" ] || [ -z "$value" ]; then
+                echo "Usage: lobster env set KEY VALUE"
+                exit 1
+            fi
+            mkdir -p "$config_dir"
 
-    exec "$env_script" "$@"
+            # All keys are written to config.env — the single canonical credential file.
+            # global.env is deprecated (issue #1785); keys that existed there have been
+            # merged into config.env by upgrade.sh migration 79.
+            local target_file="$env_file"
+
+            touch "$target_file" && chmod 600 "$target_file"
+            # Update existing key in place, or append if not present
+            if grep -qF "^${key}=" "$target_file" 2>/dev/null; then
+                # Use a temp file to avoid sed -i portability issues
+                local tmp
+                tmp=$(mktemp)
+                chmod 600 "$tmp"
+                grep -vF "^${key}=" "$target_file" > "$tmp"
+                echo "${key}=${value}" >> "$tmp"
+                mv "$tmp" "$target_file"
+                echo -e "${GREEN}Updated${NC} $key in $(basename "$target_file")"
+            else
+                echo "${key}=${value}" >> "$target_file"
+                echo -e "${GREEN}Set${NC} $key in $(basename "$target_file")"
+            fi
+            ;;
+        get)
+            local key="$2"
+            if [ -z "$key" ]; then
+                echo "Usage: lobster env get KEY"
+                exit 1
+            fi
+            # Search config.env first, then legacy global.env for backward compatibility
+            # on installs that haven't yet run upgrade.sh migration 79.
+            local found_in=""
+            local val=""
+            if grep -qE "^${key}=" "$env_file" 2>/dev/null; then
+                found_in="$env_file"
+                val=$(grep -E "^${key}=" "$env_file" | cut -d= -f2-)
+            elif grep -qF "^${key}=" "$legacy_global_env" 2>/dev/null; then
+                found_in="$legacy_global_env"
+                val=$(grep -F "^${key}=" "$legacy_global_env" | cut -d= -f2-)
+            fi
+            if [ -z "$found_in" ]; then
+                echo -e "${RED}Key not found: $key${NC}"
+                exit 1
+            fi
+            echo "$val"
+            ;;
+        list)
+            if [ ! -f "$env_file" ]; then
+                echo "(no env file at $env_file)"
+                exit 0
+            fi
+            echo -e "${CYAN}Stored keys in $env_file:${NC}"
+            grep -v '^\s*#' "$env_file" | grep -v '^\s*$' | cut -d= -f1 | sed 's/^/  /' || echo "  (empty)"
+            ;;
+        edit)
+            local editor="${EDITOR:-vi}"
+            "$editor" "$env_file"
+            ;;
+        path)
+            echo "$env_file"
+            ;;
+        "")
+            echo "Usage: lobster env <set|get|list|edit|path>"
+            echo ""
+            echo "  set KEY VALUE   Store a token or credential"
+            echo "  get KEY         Print the value of a stored key"
+            echo "  list            List all stored key names (values hidden)"
+            echo "  edit            Open the env file in \$EDITOR"
+            echo "  path            Print path to the env file"
+            exit 1
+            ;;
+        *)
+            echo "Unknown env subcommand: $subcmd"
+            echo "Usage: lobster env <set|get|list|edit|path>"
+            exit 1
+            ;;
+    esac
 }
 
 cmd_update() {
     local args=("$@")
-    local script="$HOME/lobster/scripts/update-lobster.sh"
+    local install_dir="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
+    local script="$install_dir/scripts/update-lobster.sh"
 
     if [ ! -f "$script" ]; then
         echo -e "${RED}Error: Update script not found at $script${NC}"

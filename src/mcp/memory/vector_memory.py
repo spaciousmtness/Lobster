@@ -258,14 +258,16 @@ class VectorMemory:
         vec_blob = _serialize_vector(query_embedding)
 
         # Get top candidates from vector search (fetch more than limit for merging)
+        # sqlite-vec v0.1.7-alpha+ requires `k = ?` in the WHERE clause for KNN
+        # queries with a bound parameter; `LIMIT ?` is not recognised.
         fetch_limit = limit * 3
         vec_results = self._conn.execute(
             """
             SELECT rowid, distance
             FROM events_vec
             WHERE embedding MATCH ?
+            AND k = ?
             ORDER BY distance
-            LIMIT ?
             """,
             (vec_blob, fetch_limit),
         ).fetchall()
@@ -446,6 +448,27 @@ class VectorMemory:
             event_ids,
         )
         self._conn.commit()
+
+    def get(self, event_id: int) -> "MemoryEvent | None":
+        """Fetch a single memory event by ID. Returns None if not found."""
+        events = self._fetch_events([event_id])
+        return events[0] if events else None
+
+    def delete(self, event_id: int) -> bool:
+        """Delete a memory event by ID.
+
+        Returns True if an event was deleted, False if the ID was not found.
+        The FTS5 index and vector table are updated via database triggers.
+        """
+        row = self._conn.execute(
+            "SELECT id FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        self._conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+        self._conn.execute("DELETE FROM events_vec WHERE rowid = ?", (event_id,))
+        self._conn.commit()
+        return True
 
     def close(self) -> None:
         """Close the database connection."""

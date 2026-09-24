@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""PostToolUse hook: auto-register spawned agents into agent_sessions.db and
+inflight-work.jsonl.
+
+Fires after every Agent tool call. Extracts structured metadata from the
+agent prompt (YAML frontmatter or legacy "task_id is:" text), then:
+
+1. Inserts a 'running' row into agent_sessions.db so the spawned agent is
+   immediately visible to the ghost detector and status queries. No
+   intermediate 'starting' state is used — the agent IS running at the point
+   this hook fires.
+
+2. Writes a 'running' entry to inflight-work.jsonl (issue: automate-inflight-
+   work-writes), reusing scripts/save-inflight-prompt.py's actual write logic
+   (loaded dynamically — see `_load_save_inflight_prompt_module`) so the
+   JSONL schema and prompt-file-on-disk mechanism never diverge from that
+   script. This automates a step that was previously a manual dispatcher
+   instruction (see .claude/sys.dispatcher.bootup.md, "In-Flight Work
+   Tracking") and therefore depended on an LLM remembering to run it on every
+   single Agent call — confirmed unreliable in production (no new entries
+   written since 2026-05-31 despite many subsequent agent spawns). Skipped
+   when no task_id is present, since inflight-work.jsonl entries are keyed by
+   task_id.
+
+## Frontmatter format (preferred)
+
+    ---
+    task_id: my-task
+    chat_id: ADMIN_CHAT_ID_REDACTED
+    reply_to_message_id: 10924
+    source: telegram
+    ---
+
+## Legacy text format (backward compat)
+
+    Your task_id is: my-task
+
+## Failure policy
+
+On any error (malformed input, DB unavailable, etc.) this hook appends a
+timestamped line to ~/lobster-workspace/logs/hook-failures.log and exits 0
+so the Agent call is never blocked.
+
+## settings.json configuration
+
+Add this to ~/.claude/settings.json under "hooks" -> "PostToolUse":
+
+    {
+      "matcher": "Agent",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 $HOME/lobster/hooks/auto-register-agent.py",
+          "timeout": 10
+        }
+      ]
+    }
+"""
+
+import importlib.util
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+_MESSAGES_DIR = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
+_DB_PATH = _MESSAGES_DIR / "config" / "agent_sessions.db"
+_LOG_PATH = (
+    Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    / "logs"
+    / "hook-failures.log"
+)
+
+# ---------------------------------------------------------------------------
+# PID ground truth (issue #2148, Phase 1)
+# ---------------------------------------------------------------------------
+#
+# This hook is exec'd fresh, as a direct child of the dispatcher's `claude` OS
+# process, on every Agent-tool call (PostToolUse). Verified live via
+# process-tree inspection (pstree -p) on 2026-08-03: Agent/Task-tool-spawned
+# subagents run in-process as threads of the single dispatcher `claude`
+# process — they have no OS PID of their own to record. What we CAN and do
+# record is the real PID of the dispatcher process this hook is a child of,
+# via a process-tree walk (not a flat os.getppid(), which would only be
+# correct for exactly one hop — the walk handles any intermediate wrapper
+# processes robustly, mirroring hooks/session_role.py's established
+# is_dispatcher_session() process-tree technique).
+_SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
+import agents.pid_liveness as _pid_liveness  # noqa: E402
+
+
+def _capture_dispatcher_pid() -> int | None:
+    """Best-effort: find the real dispatcher PID via a process-tree walk.
+
+    Never raises — any failure (missing /proc, unexpected process tree
+    shape, etc.) is swallowed and treated as "no dispatcher PID available",
+    exactly like a pre-migration row. Registration must never be blocked by
+    a PID-capture failure.
+    """
+    try:
+        return _pid_liveness.find_dispatcher_ancestor_pid()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Logging (failures only -- never to stdout, never exit non-zero)
+# ---------------------------------------------------------------------------
+
+def _log_failure(message: str) -> None:
+    """Append a timestamped failure entry to hook-failures.log."""
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        with _LOG_PATH.open("a") as f:
+            f.write(f"[{ts}] auto-register-agent: {message}\n")
+    except Exception:  # noqa: BLE001
+        pass  # If we can't log, there's nothing left to do
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter / metadata extraction
+# ---------------------------------------------------------------------------
+
+def _parse_yaml_frontmatter(prompt: str) -> dict:
+    """Extract key/value pairs from a YAML frontmatter block at the top of prompt.
+
+    Only handles simple scalar key: value pairs (strings and integers). Does
+    not import PyYAML to avoid external dependencies; the frontmatter format
+    is intentionally constrained.
+
+    Returns an empty dict if no valid frontmatter is found.
+    """
+    prompt = prompt.lstrip()
+    if not prompt.startswith("---"):
+        return {}
+
+    # Find the closing ---
+    rest = prompt[3:]
+    end = rest.find("\n---")
+    if end == -1:
+        return {}
+
+    block = rest[:end].strip()
+    result = {}
+    for line in block.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        result[key.strip()] = value.strip()
+    return result
+
+
+def _extract_task_id_from_text(prompt: str) -> str | None:
+    """Fall back: extract task_id from legacy 'task_id is: X' pattern."""
+    match = re.search(r"task_id\s+is:\s*(\S+)", prompt, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def extract_metadata(prompt: str) -> dict:
+    """Return a dict with task_id, chat_id, source, reply_to_message_id from prompt.
+
+    Tries YAML frontmatter first. Falls back to text parsing for task_id.
+    All values are strings (or None if absent).
+    """
+    fm = _parse_yaml_frontmatter(prompt)
+
+    task_id = fm.get("task_id") or _extract_task_id_from_text(prompt)
+    chat_id = fm.get("chat_id")
+    source = fm.get("source", "telegram")
+    reply_to_message_id = fm.get("reply_to_message_id")
+
+    return {
+        "task_id": task_id,
+        "chat_id": str(chat_id) if chat_id is not None else None,
+        "source": source or "telegram",
+        "reply_to_message_id": (
+            str(reply_to_message_id) if reply_to_message_id is not None else None
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Agent ID extraction from tool response
+# ---------------------------------------------------------------------------
+
+def extract_agent_id(tool_response: object) -> str | None:
+    """Extract agentId from the Agent tool response.
+
+    The response may be a dict or a list of content items. Handles both.
+    """
+    if isinstance(tool_response, dict):
+        agent_id = tool_response.get("agentId")
+        if agent_id:
+            return str(agent_id)
+
+    if isinstance(tool_response, list):
+        for item in tool_response:
+            if isinstance(item, dict):
+                agent_id = item.get("agentId")
+                if agent_id:
+                    return str(agent_id)
+
+    return None
+
+
+def extract_output_file(tool_response: object) -> str | None:
+    """Extract output_file from the Agent tool response if present."""
+    if isinstance(tool_response, dict):
+        output_file = tool_response.get("output_file") or tool_response.get("outputFile")
+        if output_file:
+            return str(output_file)
+
+    if isinstance(tool_response, list):
+        for item in tool_response:
+            if isinstance(item, dict):
+                output_file = item.get("output_file") or item.get("outputFile")
+                if output_file:
+                    return str(output_file)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# DB insert
+# ---------------------------------------------------------------------------
+
+def insert_agent_session(
+    *,
+    agent_id: str,
+    task_id: str | None,
+    chat_id: str | None,
+    source: str,
+    session_id: str,
+    output_file: str | None,
+    input_summary: str | None,
+    dispatcher_pid: int | None = None,
+) -> None:
+    """Insert a 'running' row into agent_sessions.db.
+
+    Uses INSERT OR IGNORE so that a richer row written by session_start
+    (which may arrive concurrently) is left untouched.
+
+    The agent IS running at the point this PostToolUse hook fires — the Agent
+    tool was just called and the subagent process is live. There is no need for
+    a provisional 'starting' state.
+
+    Raises on DB errors so the caller can log and swallow.
+    """
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(_DB_PATH))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+        # Ensure the table exists (minimal DDL -- session_store owns the full schema).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id                  TEXT PRIMARY KEY,
+                task_id             TEXT,
+                agent_type          TEXT,
+                description         TEXT NOT NULL,
+                chat_id             TEXT NOT NULL,
+                source              TEXT NOT NULL DEFAULT 'telegram',
+                status              TEXT NOT NULL DEFAULT 'running',
+                output_file         TEXT,
+                timeout_minutes     INTEGER,
+                input_summary       TEXT,
+                result_summary      TEXT,
+                parent_id           TEXT,
+                spawned_at          TEXT NOT NULL,
+                completed_at        TEXT,
+                last_seen_at        TEXT,
+                notified_at         TEXT,
+                trigger_message_id  TEXT,
+                trigger_snippet     TEXT,
+                reply_message_ids   TEXT,
+                pid                 INTEGER,
+                dispatcher_pid      INTEGER,
+                pid_captured_at     TEXT
+            )
+        """)
+        # Additive migration for DBs created before this hook wrote the
+        # pid/dispatcher_pid/pid_captured_at columns (mirrors session_store.py's
+        # _MIGRATION_STMTS pattern). Each ALTER is a no-op on a fresh table that
+        # already has the column from the CREATE TABLE above.
+        for stmt in (
+            "ALTER TABLE agent_sessions ADD COLUMN pid INTEGER",
+            "ALTER TABLE agent_sessions ADD COLUMN dispatcher_pid INTEGER",
+            "ALTER TABLE agent_sessions ADD COLUMN pid_captured_at TEXT",
+        ):
+            try:
+                conn.execute(stmt)
+            except Exception:  # noqa: BLE001
+                pass  # Column already exists — no-op
+
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        pid_captured_at = now if dispatcher_pid is not None else None
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO agent_sessions
+                (id, task_id, agent_type, description, chat_id, source,
+                 status, output_file, input_summary, spawned_at,
+                 dispatcher_pid, pid_captured_at)
+            VALUES
+                (?, ?, 'subagent', 'auto-registered by PostToolUse hook', ?, ?,
+                 'running', ?, ?, ?, ?, ?)
+            """,
+            (
+                agent_id,
+                task_id,
+                chat_id if chat_id is not None else "0",
+                source,
+                output_file,
+                input_summary,
+                now,
+                dispatcher_pid,
+                pid_captured_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# inflight-work.jsonl "running" entry (issue: automate-inflight-work-writes)
+# ---------------------------------------------------------------------------
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+_SAVE_INFLIGHT_PROMPT_SCRIPT = _SCRIPTS_DIR / "save-inflight-prompt.py"
+
+
+def _load_save_inflight_prompt_module():
+    """Dynamically import scripts/save-inflight-prompt.py.
+
+    The filename is hyphenated so it cannot be imported as a normal module --
+    load it via importlib.util the same way tests/unit/test_hooks/*.py already
+    load hyphenated hook files. Reusing the real module (rather than
+    reimplementing its I/O) guarantees the JSONL schema and prompt-file
+    mechanism never diverge from save-inflight-prompt.py.
+
+    Returns the loaded module, or None on any failure. Never raises.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "save_inflight_prompt", _SAVE_INFLIGHT_PROMPT_SCRIPT
+        )
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def write_inflight_running_entry(
+    *,
+    task_id: str | None,
+    chat_id: str | None,
+    source: str,
+    subagent_type: str | None,
+    description: str | None,
+    prompt: str,
+) -> None:
+    """Best-effort: write a 'running' entry to inflight-work.jsonl for this spawn.
+
+    Skipped entirely when task_id is None -- inflight-work.jsonl entries are
+    keyed by task_id (required by save-inflight-prompt.py's REQUIRED_FIELDS
+    and by the consumers in on-fresh-start.py / dispatcher-state-stop.py), so
+    a task_id-less spawn has nothing meaningful to record against.
+
+    Never raises -- failures are logged to hook-failures.log and swallowed,
+    mirroring insert_agent_session's failure policy so a bookkeeping problem
+    never blocks the Agent call.
+    """
+    if not task_id:
+        return
+
+    mod = _load_save_inflight_prompt_module()
+    if mod is None:
+        _log_failure(
+            f"could not load save-inflight-prompt module; "
+            f"skipped inflight-work running entry for task_id={task_id!r}"
+        )
+        return
+
+    try:
+        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            chat_id_value: object = int(chat_id) if chat_id is not None else 0
+        except (TypeError, ValueError):
+            chat_id_value = chat_id
+
+        payload = {
+            "task_id": task_id,
+            "type": subagent_type or "subagent",
+            "description": description or "",
+            "started_at": started_at,
+            "chat_id": chat_id_value,
+            "subagent_type": subagent_type,
+            "status": "running",
+        }
+
+        prompt_file_path = mod.write_prompt_file(
+            mod.INFLIGHT_PROMPTS_DIR, task_id, prompt or ""
+        )
+        entry = mod.build_jsonl_entry(payload, prompt_file_path)
+        mod.append_jsonl_entry(mod.INFLIGHT_WORK_FILE, entry)
+    except Exception as exc:  # noqa: BLE001
+        _log_failure(
+            f"failed to write inflight-work running entry for task_id={task_id!r}: {exc}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    try:
+        data = json.load(sys.stdin)
+    except Exception as exc:  # noqa: BLE001
+        _log_failure(f"failed to parse hook input JSON: {exc}")
+        sys.exit(0)
+
+    # Only handle Agent tool calls
+    tool_name = data.get("tool_name", "")
+    if tool_name != "Agent":
+        sys.exit(0)
+
+    try:
+        tool_input = data.get("tool_input", {})
+        tool_response = data.get("tool_response")
+        session_id = data.get("session_id", "")
+
+        prompt = tool_input.get("prompt", "")
+        metadata = extract_metadata(prompt)
+        agent_id = extract_agent_id(tool_response)
+        output_file = extract_output_file(tool_response)
+
+        if not agent_id:
+            # No agent ID in response -- nothing to register
+            sys.exit(0)
+
+        # Store first 500 chars of the prompt as input_summary so agent-monitor
+        # and the dispatcher can reconstruct context if the agent fails.
+        input_summary = prompt[:500] if prompt else None
+
+        dispatcher_pid = _capture_dispatcher_pid()
+
+        insert_agent_session(
+            agent_id=agent_id,
+            task_id=metadata["task_id"],
+            chat_id=metadata["chat_id"],
+            source=metadata["source"],
+            session_id=session_id,
+            output_file=output_file,
+            input_summary=input_summary,
+            dispatcher_pid=dispatcher_pid,
+        )
+
+        write_inflight_running_entry(
+            task_id=metadata["task_id"],
+            chat_id=metadata["chat_id"],
+            source=metadata["source"],
+            subagent_type=tool_input.get("subagent_type"),
+            description=tool_input.get("description"),
+            prompt=prompt,
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        _log_failure(f"unexpected error: {exc}")
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

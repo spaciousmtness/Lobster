@@ -40,10 +40,21 @@ LOBSTER_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
 WORKSPACE_DIR="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
 MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
 LOBSTER_CONFIG_DIR="${LOBSTER_CONFIG_DIR:-$HOME/lobster-config}"
+# NOTE: "${LOBSTER_USER_CONFIG:-default}" only falls back when the var is
+# UNSET/EMPTY. This script commonly runs as a child of lobster-claude.service;
+# if that unit's Environment=LOBSTER_USER_CONFIG=... line still has the raw
+# {{USER_CONFIG_DIR}} placeholder, the bad value is "set" and defeats the
+# fallback, silently re-poisoning every service file this script regenerates.
+# Sanitize before applying the default.
+case "${LOBSTER_USER_CONFIG:-}" in
+    *'{{'*) unset LOBSTER_USER_CONFIG ;;
+esac
+USER_CONFIG_DIR="${LOBSTER_USER_CONFIG:-$HOME/lobster-user-config}"
 BACKUP_BASE="$HOME/lobster-backups"
 CONFIG_FILE="$LOBSTER_CONFIG_DIR/config.env"
 LOCK_FILE="/tmp/lobster-upgrade.lock"
 VENV_DIR="$LOBSTER_DIR/.venv"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 
 # Options
 DRY_RUN=false
@@ -320,6 +331,22 @@ git_pull() {
         fi
     fi
 
+    # Ensure we're on main before pulling.
+    # If ~/lobster/ is on a feature branch or detached HEAD (e.g. after local
+    # testing), git merge --ff-only would fail. Switch to main first so the
+    # update always lands correctly.
+    local current_branch
+    current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
+    if [ "$current_branch" != "main" ]; then
+        if $DRY_RUN; then
+            info "[dry-run] Not on main branch (currently: $current_branch). Would switch to main before updating."
+        else
+            warn "Not on main branch (currently: $current_branch). Switching to main before updating..."
+            git checkout main --quiet || die "Could not checkout main. Resolve manually and re-run." 3
+            success "Switched to main"
+        fi
+    fi
+
     # Fetch
     info "Fetching from origin..."
     if $DRY_RUN; then
@@ -361,6 +388,12 @@ git_pull() {
                 die "Could not update repo. Manual intervention needed." 1
             fi
         fi
+    fi
+
+    # Abort if health-check script has syntax errors
+    if ! bash -n scripts/health-check-v3.sh; then
+        echo "ERROR: scripts/health-check-v3.sh failed syntax check — aborting upgrade" >&2
+        exit 1
     fi
 
     log_to_file "Git updated: $PREVIOUS_COMMIT -> $CURRENT_COMMIT"
@@ -609,10 +642,12 @@ create_new_directories() {
         "$MESSAGES_DIR/task-outputs"
         "$WORKSPACE_DIR/scheduled-jobs/tasks"
         "$WORKSPACE_DIR/data"
-        "$WORKSPACE_DIR/memory/canonical/people"
-        "$WORKSPACE_DIR/memory/canonical/projects"
-        "$WORKSPACE_DIR/memory/archive/digests"
         "$WORKSPACE_DIR/scheduled-jobs/logs"
+        "$WORKSPACE_DIR/reports"
+        "$USER_CONFIG_DIR/memory/canonical/people"
+        "$USER_CONFIG_DIR/memory/canonical/projects"
+        "$USER_CONFIG_DIR/memory/archive/digests"
+        "$USER_CONFIG_DIR/agents/subagents"
     )
 
     local created=0
@@ -669,10 +704,15 @@ setup_syncthing() {
     echo -e "${YELLOW}${BOLD}LobsterDrop${NC} uses Syncthing to sync files between your phone/laptop and this server."
     echo -e "It requires setup on your client device too (Syncthing app)."
     echo ""
-    read -r -p "$(echo -e "${CYAN}Install and configure Syncthing? [y/N]:${NC} ")" response
+    if [ -t 0 ]; then
+        read -r -p "$(echo -e "${CYAN}Install and configure Syncthing? [Y/n]:${NC} ")" response
+    else
+        info "No TTY detected — defaulting to install Syncthing. Use --skip-syncthing to suppress."
+        response="y"
+    fi
     echo ""
 
-    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+    if [[ -n "$response" && ! "$response" =~ ^[Yy]$ ]]; then
         info "Skipping Syncthing setup"
         return 0
     fi
@@ -836,6 +876,42 @@ restart_services() {
 
     for svc in "${services[@]}"; do
         if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            # issue #2275: restarting lobster-claude can kill this very script
+            # if it's running inside that session (e.g. a subagent doing "run
+            # lobster update"). Write a heads-up to the inbox first, same
+            # pattern as scripts/restart-mcp.sh, so a dispatcher that survives
+            # long enough to see it before the kill knows the restart was
+            # intentional and how to re-orient.
+            # NOTE: this duplicates scripts/restart-mcp.sh's write-tmp-then-mv
+            # inbox-notification pattern rather than reusing it (that script
+            # is hardcoded to the lobster-mcp service name). Keep the two in
+            # sync by hand — in particular, the sleep below is load-bearing:
+            # without it, review found the restart fires before
+            # wait_for_messages ever gets a chance to see this message,
+            # defeating its purpose entirely (issue #2275 review).
+            # The subtype is "session-restart" (issue #2279) — P0 like a
+            # compact-reminder, but without making the dispatcher treat a
+            # restart warning as a context compaction.
+            if [ "$svc" = "lobster-claude" ] && [ -d "$MESSAGES_DIR/inbox" ]; then
+                local _restart_msg_id="upgrade-claude-restart-$(date -u +%s)"
+                local _restart_status_note="migrations and health check already completed before this step ran."
+                if [ "$ERRORS" -gt 0 ] || [ "$WARNINGS" -gt 0 ]; then
+                    _restart_status_note="migrations and health check ran before this step, but logged ${ERRORS} error(s) and ${WARNINGS} warning(s) — check the upgrade log."
+                fi
+                cat > "$MESSAGES_DIR/inbox/${_restart_msg_id}.json.tmp" <<EOF
+{
+  "id": "${_restart_msg_id}",
+  "source": "system",
+  "type": "text",
+  "subtype": "session-restart",
+  "chat_id": 0,
+  "text": "LOBSTER-CLAUDE RESTART INCOMING (upgrade.sh) — this service is about to restart as the final step of an in-progress upgrade. If you are the session being restarted, this was intentional and expected: ${_restart_status_note} Re-orient after reconnecting: read sys.dispatcher.bootup.md and resume the main loop.",
+  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+                mv "$MESSAGES_DIR/inbox/${_restart_msg_id}.json.tmp" "$MESSAGES_DIR/inbox/${_restart_msg_id}.json" 2>/dev/null || true
+                sleep 2
+            fi
             substep "Restarting $svc..."
             if sudo systemctl restart "$svc" 2>/dev/null; then
                 sleep 2
@@ -908,139 +984,14 @@ update_systemd_services() {
 #===============================================================================
 # 9. Migration checks
 #===============================================================================
-
-run_migrations() {
-    step "Running migration checks"
-
-    local migrated=0
-
-    if $DRY_RUN; then
-        info "[dry-run] Would check for needed migrations"
-        return 0
-    fi
-
-    # Migration 0: Config from repo to ~/lobster-config/ (tarball-readiness)
-    mkdir -p "$LOBSTER_CONFIG_DIR"
-    if [ -f "$LOBSTER_DIR/config/config.env" ] && [ ! -f "$LOBSTER_CONFIG_DIR/config.env" ]; then
-        substep "Migrating config.env to $LOBSTER_CONFIG_DIR/ ..."
-        cp "$LOBSTER_DIR/config/config.env" "$LOBSTER_CONFIG_DIR/config.env"
-        success "Config migrated to $LOBSTER_CONFIG_DIR/config.env"
-        migrated=$((migrated + 1))
-    fi
-    if [ -f "$LOBSTER_DIR/config/lobster.conf" ] && [ ! -f "$LOBSTER_CONFIG_DIR/lobster.conf" ]; then
-        cp "$LOBSTER_DIR/config/lobster.conf" "$LOBSTER_CONFIG_DIR/lobster.conf"
-        substep "Migrated lobster.conf to $LOBSTER_CONFIG_DIR/"
-        migrated=$((migrated + 1))
-    fi
-    if [ -f "$LOBSTER_DIR/config/consolidation.conf" ] && [ ! -f "$LOBSTER_CONFIG_DIR/consolidation.conf" ]; then
-        cp "$LOBSTER_DIR/config/consolidation.conf" "$LOBSTER_CONFIG_DIR/consolidation.conf"
-        substep "Migrated consolidation.conf to $LOBSTER_CONFIG_DIR/"
-        migrated=$((migrated + 1))
-    fi
-    if [ -f "$LOBSTER_DIR/config/sync-repos.json" ] && [ ! -f "$LOBSTER_CONFIG_DIR/sync-repos.json" ]; then
-        cp "$LOBSTER_DIR/config/sync-repos.json" "$LOBSTER_CONFIG_DIR/sync-repos.json"
-        substep "Migrated sync-repos.json to $LOBSTER_CONFIG_DIR/"
-        migrated=$((migrated + 1))
-    fi
-
-    # Migration 1: Old config location (~/.lobster.env -> lobster-config/config.env)
-    if [ -f "$HOME/.lobster.env" ] && [ ! -f "$CONFIG_FILE" ]; then
-        substep "Migrating .lobster.env to $LOBSTER_CONFIG_DIR/config.env..."
-        mkdir -p "$LOBSTER_CONFIG_DIR"
-        cp "$HOME/.lobster.env" "$CONFIG_FILE"
-        success "Config migrated from ~/.lobster.env"
-        migrated=$((migrated + 1))
-    fi
-
-    # Migration 2: Old .env in repo root -> lobster-config/config.env
-    if [ -f "$LOBSTER_DIR/.env" ] && [ ! -f "$CONFIG_FILE" ]; then
-        substep "Migrating .env to $LOBSTER_CONFIG_DIR/config.env..."
-        mkdir -p "$LOBSTER_CONFIG_DIR"
-        cp "$LOBSTER_DIR/.env" "$CONFIG_FILE"
-        success "Config migrated from .env"
-        migrated=$((migrated + 1))
-    fi
-
-    # Migration 3: Lobster rename - detect and disable old service names
-    for old_svc in hyperion-router hyperion-daemon hyperion-claude; do
-        if systemctl is-enabled --quiet "$old_svc" 2>/dev/null; then
-            warn "Old service '$old_svc' found. Disabling in favor of lobster-* services."
-            sudo systemctl stop "$old_svc" 2>/dev/null || true
-            sudo systemctl disable "$old_svc" 2>/dev/null || true
-            migrated=$((migrated + 1))
-        fi
-    done
-
-    # Migration 4: Old messages directory structure (flat -> subdirs)
-    if [ -d "$MESSAGES_DIR" ] && [ ! -d "$MESSAGES_DIR/inbox" ]; then
-        substep "Messages directory missing subdirectories, creating them..."
-        mkdir -p "$MESSAGES_DIR"/{inbox,outbox,processed,processing,failed,sent,files,images,audio,config,task-outputs}
-        migrated=$((migrated + 1))
-    fi
-
-    # Migration 5: tasks.json location (lobster dir -> messages dir)
-    if [ -f "$LOBSTER_DIR/tasks.json" ] && [ ! -f "$MESSAGES_DIR/tasks.json" ]; then
-        substep "Moving tasks.json to messages directory..."
-        cp "$LOBSTER_DIR/tasks.json" "$MESSAGES_DIR/tasks.json"
-        success "tasks.json migrated"
-        migrated=$((migrated + 1))
-    fi
-
-    # Migration 6: Ensure sent directory exists for conversation history
-    if [ ! -d "$MESSAGES_DIR/sent" ]; then
-        mkdir -p "$MESSAGES_DIR/sent"
-        substep "Created sent/ directory for conversation history"
-        migrated=$((migrated + 1))
-    fi
-
-    # Migration 7: Move scheduled task definition files from repo to workspace
-    local old_tasks_dir="$LOBSTER_DIR/scheduled-tasks/tasks"
-    local new_tasks_dir="$WORKSPACE_DIR/scheduled-jobs/tasks"
-    if [ -d "$old_tasks_dir" ] && ls "$old_tasks_dir"/*.md &>/dev/null 2>&1; then
-        mkdir -p "$new_tasks_dir"
-        local task_moved=0
-        for task_file in "$old_tasks_dir"/*.md; do
-            local base
-            base=$(basename "$task_file")
-            if [ ! -f "$new_tasks_dir/$base" ]; then
-                cp "$task_file" "$new_tasks_dir/$base"
-                substep "Migrated task file: $base"
-                task_moved=$((task_moved + 1))
-            fi
-        done
-        if [ "$task_moved" -gt 0 ]; then
-            success "Migrated $task_moved task file(s) to workspace"
-            migrated=$((migrated + task_moved))
-        fi
-    fi
-
-    # Migration 8: Seed canonical templates if empty
-    local canonical_dir="$WORKSPACE_DIR/memory/canonical"
-    local templates_dir="$LOBSTER_DIR/memory/canonical-templates"
-    if [ -d "$templates_dir" ] && [ -d "$canonical_dir" ]; then
-        local md_count
-        md_count=$(find "$canonical_dir" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
-        if [ "$md_count" -eq 0 ]; then
-            for tmpl in "$templates_dir"/*.md; do
-                [ -f "$tmpl" ] || continue
-                local base
-                base=$(basename "$tmpl")
-                [[ "$base" == example-* ]] && continue
-                cp "$tmpl" "$canonical_dir/$base"
-                substep "Seeded canonical template: $base"
-                migrated=$((migrated + 1))
-            done
-        fi
-    fi
-
-    if [ "$migrated" -eq 0 ]; then
-        success "No migrations needed"
-    else
-        success "$migrated migration(s) applied"
-    fi
-
-    log_to_file "Migration check complete, $migrated migrations applied"
-}
+# run_migrations() is sourced from scripts/lib/migrations.sh, the single
+# canonical implementation shared with install.sh. See that file's header
+# for required variables/functions.
+#
+# The `source` itself lives in main(), AFTER git_pull(). Sourcing it here, at
+# file scope, would bind run_migrations() to the copy of the library that was
+# on disk when the run started, so a run that pulls a new (or fixed) migration
+# would still execute the stale definition for the rest of that same run.
 
 #===============================================================================
 # 10. Health check
@@ -1222,15 +1173,39 @@ main() {
     preflight_checks          # 0. Pre-flight
     backup_config             # 1. Backup
     git_pull                  # 2. Git pull
+
+    # Load the migration library from the code this run just pulled, not from
+    # the copy that was on disk when the run started. Must come after
+    # git_pull() and before run_migrations() below.
+    #
+    # Check existence and syntax first, the same way git_pull() vets
+    # health-check-v3.sh: this file comes from the pull, so a broken or
+    # missing one must fail with a named cause rather than a bare parse error
+    # from somewhere inside main().
+    if [ ! -f "$LOBSTER_DIR/scripts/lib/migrations.sh" ]; then
+        die "Migration library not found: $LOBSTER_DIR/scripts/lib/migrations.sh" 1
+    fi
+    bash -n "$LOBSTER_DIR/scripts/lib/migrations.sh" \
+        || die "Migration library failed syntax check: $LOBSTER_DIR/scripts/lib/migrations.sh" 1
+    # shellcheck source=scripts/lib/migrations.sh
+    source "$LOBSTER_DIR/scripts/lib/migrations.sh" \
+        || die "Could not load migration library: $LOBSTER_DIR/scripts/lib/migrations.sh" 1
+
     show_whats_new            # 2b. Show what's new
     update_python_deps        # 3. Python deps
     create_new_directories    # 4. New directories
     setup_syncthing           # 5. Syncthing (optional/prompted)
     install_playwright        # 6. Playwright/Chromium
     update_systemd_services   # 8. Systemd updates
-    restart_services          # 7. Service restarts
     run_migrations            # 9. Migrations
     health_check              # 10. Health check
+    restart_services          # 7. Service restarts — MUST be last (issue #2275):
+                               # restarting lobster-claude can kill this very
+                               # script if it is running inside that session
+                               # (e.g. a subagent invoked "run lobster update").
+                               # Every step whose result matters (migrations,
+                               # health check) must already be complete and
+                               # logged before this runs.
 
     local elapsed=$(( $(date +%s) - start_time ))
 

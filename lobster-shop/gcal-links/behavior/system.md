@@ -8,10 +8,13 @@ Run this check (takes < 1 second, no network call):
 
 ```python
 import sys
-sys.path.insert(0, "/home/admin/lobster/src")
+import os
+sys.path.insert(0, os.path.expanduser("~/lobster/src"))
 from integrations.google_calendar.token_store import load_token
+from mcp.user_model.owner import read_owner
 
-OWNER_USER_ID = "1234567890"  # Replace with owner's Telegram chat_id
+owner = read_owner()
+OWNER_USER_ID = owner.get("owner", {}).get("telegram_chat_id", "")
 token = load_token(OWNER_USER_ID)
 is_authenticated = token is not None
 ```
@@ -53,11 +56,12 @@ Subagent code pattern:
 
 ```python
 import sys
-sys.path.insert(0, "/home/admin/lobster/src")
+import os
+sys.path.insert(0, os.path.expanduser("~/lobster/src"))
 from integrations.google_calendar.client import get_upcoming_events
 from utils.calendar import gcal_add_link_md
 
-events = get_upcoming_events(user_id="1234567890", days=7)
+events = get_upcoming_events(user_id=OWNER_USER_ID, days=7)
 if not events:
     reply = "No upcoming events in the next 7 days."
 else:
@@ -75,13 +79,14 @@ Delegate to a background subagent. After creating via API, always include a deep
 
 ```python
 import sys
-sys.path.insert(0, "/home/admin/lobster/src")
+import os
+sys.path.insert(0, os.path.expanduser("~/lobster/src"))
 from integrations.google_calendar.client import create_event
 from utils.calendar import gcal_add_link_md
 from datetime import datetime, timezone
 
 event = create_event(
-    user_id="1234567890",
+    user_id=OWNER_USER_ID,
     title="Meeting with Sarah",
     start=datetime(2026, 3, 7, 14, 0, tzinfo=timezone.utc),
     end=datetime(2026, 3, 7, 15, 0, tzinfo=timezone.utc),
@@ -105,21 +110,57 @@ else:
 
 ### Auth trigger ("connect my Google Calendar", "authenticate Google Calendar", "link Google Calendar")
 
+When the user explicitly wants to connect their Google Calendar, use `generate_consent_link()` to
+send them a one-time myownlobster.ai OAuth URL. This replaces the old direct OAuth URL approach.
+
 Respond immediately on the main thread — no subagent needed:
 
 ```python
-import sys, secrets
-sys.path.insert(0, "/home/admin/lobster/src")
-from integrations.google_calendar.config import is_enabled
-from integrations.google_calendar.oauth import generate_auth_url
+import sys
+import os
+import logging
+sys.path.insert(0, os.path.expanduser("~/lobster/src"))
+from utils.calendar import gcal_add_link_md
+from datetime import datetime, timezone
 
-if not is_enabled():
-    reply = "Google Calendar isn't configured on this Lobster instance. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in config.env."
-else:
-    state = secrets.token_urlsafe(32)
-    url = generate_auth_url(state=state)
-    reply = f"Click to connect your Google Calendar:\n[Authorize Google Calendar]({url})\n\nThis link expires after a few minutes."
+log = logging.getLogger(__name__)
+
+try:
+    from integrations.google_auth.consent import generate_consent_link
+    url = generate_consent_link("calendar")
+    reply = (
+        "To connect your Google Calendar, tap this link (expires in 30 minutes):\n"
+        f"[Connect Google Calendar]({url})\n\n"
+        "After connecting, I'll be able to read and create calendar events for you.\n\n"
+        "Note: Google may show an \"unverified app\" warning screen first — that's "
+        "expected for this app right now, not a sign anything is wrong. Tap "
+        "**Advanced**, then tap the \"Go to ... (unsafe)\" link near the bottom to continue."
+    )
+except Exception as exc:
+    # Graceful fallback: generate_consent_link raises if env vars are missing
+    # or if the myownlobster.ai endpoint is unreachable. Fall back to a deep link
+    # so the user still gets a useful response.
+    log.warning(
+        "generate_consent_link('calendar') failed — falling back to deep link: %s",
+        exc,
+    )
+    from utils.calendar import gcal_add_link_md
+    from datetime import datetime, timezone
+    link = gcal_add_link_md(
+        title="My Event",
+        start=datetime.now(tz=timezone.utc),
+    )
+    reply = (
+        "I couldn't generate a connection link right now. "
+        "You can still add individual events to your calendar using this link:\n"
+        f"{link}"
+    )
 ```
+
+> **Note:** Deep link behavior (Mode A) for individual event creation remains available and is
+> not affected by this flow. If the user just wants to add a single event without connecting their
+> calendar, generate the deep link as usual. Only use `generate_consent_link()` when the user
+> explicitly asks to **connect** their calendar.
 
 ---
 
@@ -130,13 +171,16 @@ else:
 | "what's on my calendar" / "what do I have today/this week" | Read events |
 | "add [event] to my calendar" / "schedule [event] for [time]" | Create event |
 | "do I have anything on [day]" / "am I free on [day]" | Read events |
-| "connect my Google Calendar" / "link Google Calendar" / "authenticate Google Calendar" | Auth flow |
+| "connect my Google Calendar" / "link Google Calendar" / "authenticate Google Calendar" | Auth flow — use `generate_consent_link("calendar")` |
 
 ---
 
 ### Graceful degradation
 
 If the API call returns empty or None (auth failure, network error), always fall back to a deep link. Never surface token values, error codes, or credentials in Telegram messages.
+
+If `generate_consent_link()` raises (missing env vars, network error), fall back to a deep link
+and log a warning. Do not surface the exception message to the user.
 
 ---
 

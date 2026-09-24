@@ -10,16 +10,19 @@ Schema migration strategy: versioned, idempotent, forward-only.
 import json
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .schema import (
+    ActivityRhythm,
     AttentionCategory,
     AttentionItem,
     BlindSpot,
     Contradiction,
+    DriftRecord,
     EmotionalState,
+    InferenceCacheEntry,
     LifePattern,
     ModelMetadata,
     NarrativeArc,
@@ -29,9 +32,10 @@ from .schema import (
     Observation,
     ObservationSignalType,
     PreferenceNode,
+    TemporalSnapshot,
 )
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +48,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     current = _get_schema_version(conn)
     if current < 1:
         _apply_v1(conn)
+    if current < 2:
+        _apply_v2(conn)
+    if current < 3:
+        _apply_v3(conn)
     _set_schema_version(conn, CURRENT_SCHEMA_VERSION)
 
 
@@ -201,6 +209,118 @@ def _apply_v1(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _apply_v2(conn: sqlite3.Connection) -> None:
+    """Apply version 2 schema — new tables + ALTER TABLE additions."""
+
+    # New tables
+    conn.executescript("""
+        -- Temporal snapshots: weekly preference graph state captures
+        CREATE TABLE IF NOT EXISTS um_temporal_snapshots (
+            id          TEXT PRIMARY KEY,
+            snapshot_at TEXT NOT NULL,
+            week_number INTEGER NOT NULL,
+            year        INTEGER NOT NULL,
+            data        TEXT NOT NULL,
+            obs_count   INTEGER NOT NULL DEFAULT 0,
+            node_count  INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS um_snap_week ON um_temporal_snapshots(year, week_number);
+
+        -- Drift records: detected week-over-week changes
+        CREATE TABLE IF NOT EXISTS um_drift_records (
+            id              TEXT PRIMARY KEY,
+            detected_at     TEXT NOT NULL,
+            snapshot_a_id   TEXT NOT NULL,
+            snapshot_b_id   TEXT NOT NULL,
+            drift_type      TEXT NOT NULL,
+            description     TEXT NOT NULL,
+            magnitude       REAL NOT NULL,
+            node_id         TEXT,
+            surfaced        INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS um_drift_detected ON um_drift_records(detected_at);
+
+        -- Activity rhythm: hourly/daily message distribution
+        CREATE TABLE IF NOT EXISTS um_activity_rhythm (
+            id             TEXT PRIMARY KEY,
+            hour_of_day    INTEGER NOT NULL,
+            day_of_week    INTEGER NOT NULL,
+            message_count  INTEGER NOT NULL DEFAULT 0,
+            total_length   INTEGER NOT NULL DEFAULT 0,
+            total_latency  REAL NOT NULL DEFAULT 0.0,
+            latency_count  INTEGER NOT NULL DEFAULT 0,
+            updated_at     TEXT NOT NULL,
+            UNIQUE(hour_of_day, day_of_week)
+        );
+
+        -- Inference cache: short-lived prediction results
+        CREATE TABLE IF NOT EXISTS um_inference_cache (
+            id          TEXT PRIMARY KEY,
+            cache_key   TEXT NOT NULL UNIQUE,
+            result      TEXT NOT NULL,
+            confidence  REAL NOT NULL,
+            created_at  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            hit_count   INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS um_cache_expires ON um_inference_cache(expires_at);
+    """)
+    conn.commit()
+
+    # Column additions to existing tables — SQLite doesn't support IF NOT EXISTS
+    # in ALTER TABLE, so we query the column list first.
+    def _add_column_if_missing(table: str, column: str, col_def: str) -> None:
+        cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+            conn.commit()
+
+    # um_observations additions
+    _add_column_if_missing("um_observations", "latency_ms", "INTEGER")
+    _add_column_if_missing("um_observations", "reply_length", "INTEGER")
+    _add_column_if_missing("um_observations", "is_followup", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing("um_observations", "source_specificity", "TEXT DEFAULT 'heuristic'")
+
+    # um_preference_nodes additions
+    _add_column_if_missing("um_preference_nodes", "seed_source", "TEXT")
+    _add_column_if_missing("um_preference_nodes", "decay_rate_override", "REAL")
+    _add_column_if_missing("um_preference_nodes", "temporal_weight", "REAL NOT NULL DEFAULT 1.0")
+
+
+def _apply_v3(conn: sqlite3.Connection) -> None:
+    """Apply version 3 schema — add user_id column for multi-user isolation.
+
+    Existing rows get user_id='default' (the original/primary user).
+    """
+    def _add_column_if_missing(table: str, column: str, col_def: str) -> None:
+        cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+
+    tables_to_update = [
+        "um_observations",
+        "um_preference_nodes",
+        "um_emotional_states",
+        "um_blind_spots",
+        "um_attention_items",
+        "um_inference_cache",
+    ]
+
+    for table in tables_to_update:
+        _add_column_if_missing(table, "user_id", "TEXT NOT NULL DEFAULT 'default'")
+
+    conn.commit()
+
+    # Add indexes on user_id for each table
+    for table in tables_to_update:
+        idx_name = f"um_{table.replace('um_', '')}_user_id"
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table}(user_id)"
+        )
+
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
@@ -210,27 +330,32 @@ def _new_id() -> str:
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
-    return datetime.fromisoformat(s)
+    dt = datetime.fromisoformat(s)
+    # Rows written before the tz-aware migration are naive UTC strings.
+    # Attach UTC so comparisons with datetime.now(timezone.utc) never raise TypeError.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 # ---------------------------------------------------------------------------
 # Observation CRUD
 # ---------------------------------------------------------------------------
 
-def insert_observation(conn: sqlite3.Connection, obs: Observation) -> str:
+def insert_observation(conn: sqlite3.Connection, obs: Observation, user_id: str = "default") -> str:
     """Insert an observation and return its ID."""
     obs_id = _new_id()
     conn.execute(
         """INSERT INTO um_observations
            (id, message_id, signal_type, content, confidence, context,
-            metadata, observed_at, processed)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            metadata, observed_at, processed, user_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             obs_id,
             obs.message_id,
@@ -241,6 +366,7 @@ def insert_observation(conn: sqlite3.Connection, obs: Observation) -> str:
             json.dumps(obs.metadata),
             obs.observed_at.isoformat(),
             1 if obs.processed else 0,
+            user_id,
         ),
     )
     conn.commit()
@@ -273,7 +399,7 @@ def get_recent_observations(
     limit: int = 100,
 ) -> list[Observation]:
     """Get recent observations, optionally filtered by signal type."""
-    cutoff = datetime.utcnow()
+    cutoff = datetime.now(timezone.utc)
     cutoff_iso = cutoff.replace(
         hour=cutoff.hour - min(hours, cutoff.hour),
     ).isoformat()
@@ -305,7 +431,7 @@ def _row_to_observation(row: sqlite3.Row) -> Observation:
         confidence=row["confidence"],
         context=row["context"],
         metadata=json.loads(row["metadata"]),
-        observed_at=datetime.fromisoformat(row["observed_at"]),
+        observed_at=_parse_dt(row["observed_at"]),
         processed=bool(row["processed"]),
     )
 
@@ -318,7 +444,7 @@ def upsert_preference_node(conn: sqlite3.Connection, node: PreferenceNode) -> st
     """Insert or update a preference node. Returns node ID."""
     if not node.id:
         node.id = _new_id()
-    node.updated_at = datetime.utcnow()
+    node.updated_at = datetime.now(timezone.utc)
     conn.execute(
         """INSERT INTO um_preference_nodes
            (id, name, node_type, strength, flexibility, contexts, source,
@@ -442,8 +568,8 @@ def _row_to_preference_node(row: sqlite3.Row) -> PreferenceNode:
         description=row["description"],
         evidence_count=row["evidence_count"],
         last_observed=_parse_dt(row["last_observed"]),
-        created_at=datetime.fromisoformat(row["created_at"]),
-        updated_at=datetime.fromisoformat(row["updated_at"]),
+        created_at=_parse_dt(row["created_at"]),
+        updated_at=_parse_dt(row["updated_at"]),
         decay_rate=row["decay_rate"],
     )
 
@@ -509,7 +635,7 @@ def get_recent_emotional_states(
             dominance=r["dominance"],
             trigger=r["trigger"],
             context=r["context"],
-            recorded_at=datetime.fromisoformat(r["recorded_at"]),
+            recorded_at=_parse_dt(r["recorded_at"]),
             confidence=r["confidence"],
         )
         for r in rows
@@ -561,7 +687,7 @@ def get_blind_spots(
             evidence=r["evidence"],
             surfaced=bool(r["surfaced"]),
             confidence=r["confidence"],
-            created_at=datetime.fromisoformat(r["created_at"]),
+            created_at=_parse_dt(r["created_at"]),
         )
         for r in rows
     ]
@@ -608,7 +734,7 @@ def get_active_contradictions(conn: sqlite3.Connection) -> list[Contradiction]:
             tension_score=r["tension_score"],
             resolved=bool(r["resolved"]),
             resolution=r["resolution"],
-            detected_at=datetime.fromisoformat(r["detected_at"]),
+            detected_at=_parse_dt(r["detected_at"]),
         )
         for r in rows
     ]
@@ -622,7 +748,7 @@ def upsert_narrative_arc(conn: sqlite3.Connection, arc: NarrativeArc) -> str:
     """Insert or update a narrative arc. Returns ID."""
     if not arc.id:
         arc.id = _new_id()
-    arc.last_updated = datetime.utcnow()
+    arc.last_updated = datetime.now(timezone.utc)
     conn.execute(
         """INSERT INTO um_narrative_arcs
            (id, title, description, themes, status, started_at, last_updated, resolution)
@@ -659,8 +785,8 @@ def get_active_narrative_arcs(conn: sqlite3.Connection) -> list[NarrativeArc]:
             description=r["description"],
             themes=json.loads(r["themes"]),
             status=r["status"],
-            started_at=datetime.fromisoformat(r["started_at"]),
-            last_updated=datetime.fromisoformat(r["last_updated"]),
+            started_at=_parse_dt(r["started_at"]),
+            last_updated=_parse_dt(r["last_updated"]),
             resolution=r["resolution"],
         )
         for r in rows
@@ -675,7 +801,7 @@ def upsert_life_pattern(conn: sqlite3.Connection, pattern: LifePattern) -> str:
     """Insert or update a life pattern. Returns ID."""
     if not pattern.id:
         pattern.id = _new_id()
-    pattern.last_seen = datetime.utcnow()
+    pattern.last_seen = datetime.now(timezone.utc)
     conn.execute(
         """INSERT INTO um_life_patterns
            (id, name, description, stage, evidence_count, confidence, first_seen, last_seen)
@@ -714,8 +840,8 @@ def get_active_life_patterns(conn: sqlite3.Connection) -> list[LifePattern]:
             stage=r["stage"],
             evidence_count=r["evidence_count"],
             confidence=r["confidence"],
-            first_seen=datetime.fromisoformat(r["first_seen"]),
-            last_seen=datetime.fromisoformat(r["last_seen"]),
+            first_seen=_parse_dt(r["first_seen"]),
+            last_seen=_parse_dt(r["last_seen"]),
         )
         for r in rows
     ]
@@ -776,7 +902,7 @@ def get_attention_stack(
             context=r["context"],
             source=r["source"],
             metadata=json.loads(r["metadata"]),
-            created_at=datetime.fromisoformat(r["created_at"]),
+            created_at=_parse_dt(r["created_at"]),
             expires_at=_parse_dt(r["expires_at"]),
         )
         for r in rows
@@ -810,7 +936,7 @@ def get_model_metadata(conn: sqlite3.Connection) -> ModelMetadata:
     return ModelMetadata(
         schema_version=int(_get("schema_version") or "0"),
         owner_id=_get("owner_id"),
-        created_at=datetime.fromisoformat(created_str) if created_str else datetime.utcnow(),
+        created_at=_parse_dt(created_str) if created_str else datetime.now(timezone.utc),
         last_observation_at=_parse_dt(last_obs_str),
         last_consolidation_at=_parse_dt(last_consol_str),
         observation_count=obs_count,
@@ -825,6 +951,273 @@ def set_metadata_value(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Temporal Snapshot CRUD (v2)
+# ---------------------------------------------------------------------------
+
+def insert_temporal_snapshot(conn: sqlite3.Connection, snapshot: TemporalSnapshot) -> str:
+    """Insert a temporal snapshot. Returns ID."""
+    snap_id = _new_id()
+    conn.execute(
+        """INSERT INTO um_temporal_snapshots
+           (id, snapshot_at, week_number, year, data, obs_count, node_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            snap_id,
+            snapshot.snapshot_at.isoformat(),
+            snapshot.week_number,
+            snapshot.year,
+            json.dumps(snapshot.data),
+            snapshot.obs_count,
+            snapshot.node_count,
+        ),
+    )
+    conn.commit()
+    return snap_id
+
+
+def get_latest_snapshot(conn: sqlite3.Connection) -> "TemporalSnapshot | None":
+    """Get the most recent temporal snapshot."""
+    row = conn.execute(
+        "SELECT * FROM um_temporal_snapshots ORDER BY snapshot_at DESC LIMIT 1"
+    ).fetchone()
+    return _row_to_snapshot(row) if row else None
+
+
+def get_snapshot_by_week(conn: sqlite3.Connection, year: int, week: int) -> "TemporalSnapshot | None":
+    """Get snapshot for a specific ISO week."""
+    row = conn.execute(
+        "SELECT * FROM um_temporal_snapshots WHERE year = ? AND week_number = ?",
+        (year, week),
+    ).fetchone()
+    return _row_to_snapshot(row) if row else None
+
+
+def get_snapshots_since(conn: sqlite3.Connection, days: int = 30) -> list:
+    """Get snapshots from the last N days."""
+    rows = conn.execute(
+        """SELECT * FROM um_temporal_snapshots
+           WHERE snapshot_at > datetime('now', ?)
+           ORDER BY snapshot_at DESC""",
+        (f"-{days} days",),
+    ).fetchall()
+    return [_row_to_snapshot(r) for r in rows]
+
+
+def _row_to_snapshot(row: sqlite3.Row) -> TemporalSnapshot:
+    return TemporalSnapshot(
+        id=row["id"],
+        snapshot_at=_parse_dt(row["snapshot_at"]),
+        week_number=row["week_number"],
+        year=row["year"],
+        data=json.loads(row["data"]),
+        obs_count=row["obs_count"],
+        node_count=row["node_count"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Drift Record CRUD (v2)
+# ---------------------------------------------------------------------------
+
+def insert_drift_record(conn: sqlite3.Connection, record: DriftRecord) -> str:
+    """Insert a drift record. Returns ID."""
+    drift_id = _new_id()
+    conn.execute(
+        """INSERT INTO um_drift_records
+           (id, detected_at, snapshot_a_id, snapshot_b_id, drift_type, description,
+            magnitude, node_id, surfaced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            drift_id,
+            record.detected_at.isoformat(),
+            record.snapshot_a_id,
+            record.snapshot_b_id,
+            record.drift_type,
+            record.description,
+            record.magnitude,
+            record.node_id,
+            1 if record.surfaced else 0,
+        ),
+    )
+    conn.commit()
+    return drift_id
+
+
+def get_recent_drifts(conn: sqlite3.Connection, limit: int = 10) -> list:
+    """Get most recent drift records."""
+    rows = conn.execute(
+        "SELECT * FROM um_drift_records ORDER BY detected_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [_row_to_drift(r) for r in rows]
+
+
+def get_unsurfaced_drifts(conn: sqlite3.Connection) -> list:
+    """Get drift records not yet shown to the user."""
+    rows = conn.execute(
+        "SELECT * FROM um_drift_records WHERE surfaced = 0 ORDER BY magnitude DESC"
+    ).fetchall()
+    return [_row_to_drift(r) for r in rows]
+
+
+def _row_to_drift(row: sqlite3.Row) -> DriftRecord:
+    return DriftRecord(
+        id=row["id"],
+        detected_at=_parse_dt(row["detected_at"]),
+        snapshot_a_id=row["snapshot_a_id"],
+        snapshot_b_id=row["snapshot_b_id"],
+        drift_type=row["drift_type"],
+        description=row["description"],
+        magnitude=row["magnitude"],
+        node_id=row["node_id"],
+        surfaced=bool(row["surfaced"]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Activity Rhythm CRUD (v2)
+# ---------------------------------------------------------------------------
+
+def update_activity_rhythm(
+    conn: sqlite3.Connection,
+    hour_of_day: int,
+    day_of_week: int,
+    message_length: int,
+    latency_ms: int | None = None,
+) -> None:
+    """
+    Upsert activity rhythm for the given (hour, day) slot.
+    Increments message_count, accumulates length and latency totals.
+    """
+    now_iso = _now_iso()
+    existing = conn.execute(
+        "SELECT * FROM um_activity_rhythm WHERE hour_of_day = ? AND day_of_week = ?",
+        (hour_of_day, day_of_week),
+    ).fetchone()
+
+    if existing:
+        new_count = existing["message_count"] + 1
+        new_total_length = existing["total_length"] + message_length
+        new_total_latency = existing["total_latency"] + (latency_ms or 0)
+        new_latency_count = existing["latency_count"] + (1 if latency_ms is not None else 0)
+        conn.execute(
+            """UPDATE um_activity_rhythm
+               SET message_count=?, total_length=?, total_latency=?, latency_count=?, updated_at=?
+               WHERE hour_of_day=? AND day_of_week=?""",
+            (new_count, new_total_length, new_total_latency, new_latency_count, now_iso,
+             hour_of_day, day_of_week),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO um_activity_rhythm
+               (id, hour_of_day, day_of_week, message_count, total_length, total_latency,
+                latency_count, updated_at)
+               VALUES (?, ?, ?, 1, ?, ?, ?, ?)""",
+            (_new_id(), hour_of_day, day_of_week, message_length,
+             latency_ms or 0, 1 if latency_ms is not None else 0, now_iso),
+        )
+    conn.commit()
+
+
+def get_activity_rhythm(conn: sqlite3.Connection) -> list:
+    """Get all activity rhythm entries."""
+    rows = conn.execute(
+        "SELECT * FROM um_activity_rhythm ORDER BY day_of_week, hour_of_day"
+    ).fetchall()
+    return [
+        ActivityRhythm(
+            id=r["id"],
+            hour_of_day=r["hour_of_day"],
+            day_of_week=r["day_of_week"],
+            message_count=r["message_count"],
+            total_length=r["total_length"],
+            total_latency=r["total_latency"],
+            latency_count=r["latency_count"],
+            updated_at=_parse_dt(r["updated_at"]),
+        )
+        for r in rows
+    ]
+
+
+def get_peak_activity_hours(conn: sqlite3.Connection, top_n: int = 3) -> list[int]:
+    """Return the top N most active hours (across all days)."""
+    rows = conn.execute(
+        """SELECT hour_of_day, SUM(message_count) as total
+           FROM um_activity_rhythm
+           GROUP BY hour_of_day
+           ORDER BY total DESC
+           LIMIT ?""",
+        (top_n,),
+    ).fetchall()
+    return [r["hour_of_day"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Inference Cache CRUD (v2)
+# ---------------------------------------------------------------------------
+
+def get_cached_inference(conn: sqlite3.Connection, cache_key: str) -> "dict | None":
+    """Return cached inference result if not expired, else None."""
+    row = conn.execute(
+        """SELECT * FROM um_inference_cache
+           WHERE cache_key = ? AND expires_at > datetime('now')""",
+        (cache_key,),
+    ).fetchone()
+    if not row:
+        return None
+    # Increment hit count
+    conn.execute(
+        "UPDATE um_inference_cache SET hit_count = hit_count + 1 WHERE cache_key = ?",
+        (cache_key,),
+    )
+    conn.commit()
+    return json.loads(row["result"])
+
+
+def set_cached_inference(
+    conn: sqlite3.Connection,
+    cache_key: str,
+    result: dict,
+    confidence: float,
+    ttl_minutes: int = 30,
+) -> str:
+    """Cache an inference result with TTL. Returns cache entry ID."""
+    from datetime import timedelta
+    entry_id = _new_id()
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=ttl_minutes)
+    conn.execute(
+        """INSERT INTO um_inference_cache
+           (id, cache_key, result, confidence, created_at, expires_at, hit_count)
+           VALUES (?, ?, ?, ?, ?, ?, 0)
+           ON CONFLICT(cache_key) DO UPDATE SET
+             result=excluded.result, confidence=excluded.confidence,
+             created_at=excluded.created_at, expires_at=excluded.expires_at,
+             hit_count=0""",
+        (
+            entry_id, cache_key, json.dumps(result), confidence,
+            now.isoformat(), expires.isoformat(),
+        ),
+    )
+    conn.commit()
+    return entry_id
+
+
+def cleanup_expired_cache(conn: sqlite3.Connection) -> int:
+    """Remove expired inference cache entries. Returns count removed."""
+    cursor = conn.execute(
+        "DELETE FROM um_inference_cache WHERE expires_at <= datetime('now')"
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def get_observation_count(conn: sqlite3.Connection) -> int:
+    """Return total count of all observations."""
+    return conn.execute("SELECT COUNT(*) as n FROM um_observations").fetchone()["n"]
 
 
 # ---------------------------------------------------------------------------

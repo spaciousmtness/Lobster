@@ -14,8 +14,12 @@ WORKSPACE_DIR="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
 INSTALL_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
 MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
 
-# Ensure Claude is in PATH
-export PATH="$HOME/.local/bin:$PATH"
+# Ensure Claude and npm global tools (vercel, prisma) are in PATH
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+
+# Prevent "cannot launch inside another Claude Code session" error.
+# CLAUDECODE leaks when this script is run from an interactive Claude session.
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
 
 # Verify claude is available
 if ! command -v claude &>/dev/null; then

@@ -5,27 +5,21 @@ Only these names are imported by external code (inbox_server.py).
 Everything else stays internal to the package.
 
 Usage in inbox_server.py:
-    from user_model import create_user_model, USER_MODEL_ENABLED
-    if USER_MODEL_ENABLED:
-        user_model = create_user_model()
-        # Per-message: user_model.observe(message_text, message_id)
-        # MCP tools: user_model.dispatch(tool_name, args)
+    from user_model import create_user_model
+    user_model = create_user_model()
+    # Per-message: user_model.observe(message_text, message_id)
+    # MCP tools: user_model.dispatch(tool_name, args)
 """
 
-import os
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from .db import open_db, set_metadata_value
-from .owner import get_owner_id, ensure_owner_toml
+from .owner import get_owner_id, ensure_owner_toml, get_owner_timezone
 from .tools import USER_MODEL_TOOL_DEFINITIONS, dispatch
 from .markdown_sync import sync_all
 from .observation import observe_message
-
-
-# Feature flag: LOBSTER_USER_MODEL=true to enable (default: false until stable)
-USER_MODEL_ENABLED = os.environ.get("LOBSTER_USER_MODEL", "false").lower() == "true"
 
 
 class UserModel:
@@ -58,8 +52,14 @@ class UserModel:
                 "SELECT value FROM um_metadata WHERE key = 'created_at'"
             ).fetchone()
             if not row:
-                from datetime import datetime
-                set_metadata_value(self._conn, "created_at", datetime.utcnow().isoformat())
+                from datetime import datetime, timezone
+                set_metadata_value(self._conn, "created_at", datetime.now(timezone.utc).isoformat())
+            # Seed bootstrap from owner.toml (non-critical)
+            try:
+                from .seed import reseed_if_needed
+                reseed_if_needed(self._conn)
+            except Exception:
+                pass
         return self._conn
 
     def observe(
@@ -87,10 +87,22 @@ class UserModel:
 
     def get_context(self, contexts: list[str] | None = None) -> str:
         """
-        Return a brief markdown context snippet for the given contexts.
-        Used for context injection into the main loop.
+        Return a brief markdown context snippet.
+        First tries the pre-computed cache file (fast path, <1ms).
+        Falls back to live DB query if cache doesn't exist.
         Returns empty string on failure (graceful degradation).
         """
+        # Fast path: read pre-computed cache
+        try:
+            cache_path = Path(self._workspace_path) / "user-model" / "_context.md" if self._workspace_path else None
+            if cache_path and cache_path.exists():
+                content = cache_path.read_text(encoding="utf-8")
+                if content.strip():
+                    return content
+        except Exception:
+            pass
+
+        # Slow path: live query
         try:
             from .introspection import get_resolved_preferences
             prefs = get_resolved_preferences(
@@ -102,6 +114,17 @@ class UserModel:
             for p in prefs["preferences"][:5]:
                 lines.append(f"- {p['name']}: {p['description'][:80]}")
             return "\n".join(lines)
+        except Exception:
+            return ""
+
+    def get_user_context(self) -> str:
+        """
+        Return a compact user profile context string for system prompt injection.
+        Graceful degradation — returns empty string on failure.
+        """
+        try:
+            from .profile import get_compact_context
+            return get_compact_context()
         except Exception:
             return ""
 
@@ -191,6 +214,5 @@ def create_user_model(
 __all__ = [
     "UserModel",
     "create_user_model",
-    "USER_MODEL_ENABLED",
     "USER_MODEL_TOOL_DEFINITIONS",
 ]

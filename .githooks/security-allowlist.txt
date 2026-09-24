@@ -17,6 +17,8 @@ tests/unit/test_memory.py:test_data
 
 # Example config files (contain placeholder values)
 config/config.env.example:Hardcoded token
+# LOBSTER_SECONDARY_EMAIL example uses a placeholder address (partner@yourcompany.com) — not real
+config/config.env.example:Email address
 
 # Install script uses variable references that look like secrets
 install.sh:Hardcoded token
@@ -24,3 +26,80 @@ install.sh:Hardcoded password
 
 # User-Agent string contains version numbers that look like IP addresses
 src/mcp/inbox_server.py:IP address
+
+# These files contain intentional placeholder references (phone numbers for bots,
+# secrets in test fixtures, or documentation examples) that are pre-existing and
+# reviewed. The fork's pre-push scanner flags them as new because it diffs against
+# the fork's default branch, which may lag behind upstream.
+CLAUDE.md:Phone number
+config/config.env.example:Phone number
+lobster-shop/gcal-links/behavior/system.md:Phone number
+lobster-shop/gcal-links/context/reference.md:Phone number
+src/bot/sms_router.py:Phone number
+src/integrations/google_calendar/config.py:Hardcoded token
+tests/unit/test_integrations/test_google_calendar_config.py:Hardcoded token
+tests/unit/test_integrations/test_google_calendar_oauth.py:Hardcoded token
+tests/unit/test_integrations/test_google_calendar_phase4.py:Hardcoded token
+tests/unit/test_integrations/test_google_calendar_token_store.py:Hardcoded token
+uv.lock:Phone number
+
+# iva-deployer documents env var names (HCLOUD_TOKEN, SECRET_KEY) as configuration
+# references — not actual credential values
+agents/iva-deployer.md:Hardcoded token
+agents/iva-deployer.md:Hardcoded secret
+
+# kissinger bins contain a pre-existing email address used as a contact reference
+lobster-shop/kissinger/bin/kissinger:Email address
+lobster-shop/kissinger/bin/kissinger-mcp:Email address
+
+# WhatsApp connector config examples use example JID format strings (digits@c.us) in comments/docs
+connectors/whatsapp/config.example.env:Email address
+connectors/whatsapp/setup.sh:Email address
+scripts/lobster-whatsapp-qr:Email address
+
+# google calendar callback and client test files use fake/mock tokens for unit tests
+tests/unit/test_integrations/test_google_calendar_callback_server.py:Hardcoded token
+tests/unit/test_integrations/test_google_calendar_client.py:Hardcoded token
+
+# WhatsApp bridge test file uses mock WhatsApp contact IDs (format: digits@c.us or digits@g.us)
+# These are WhatsApp-specific format strings, not real phone numbers or email addresses
+src/bot/test_whatsapp_bridge_adapter.py:Email address
+
+# WhatsApp connector files use example JID format strings (digits@c.us) in comments and docs
+# These are placeholder format examples, not real phone numbers or email addresses
+config/whatsapp.env.example:Email address
+connectors/whatsapp/.env.example:Email address
+connectors/whatsapp/.env.example:Phone number
+connectors/whatsapp/index.js:Email address
+scripts/install-whatsapp-connector.sh:Email address
+src/bot/whatsapp_bridge_adapter.py:Email address
+
+# claude-wrapper.exp reads TELEGRAM_BOT_TOKEN from config.env at runtime using
+# grep — this is a variable reference, not a hardcoded credential value
+scripts/claude-wrapper.exp:Hardcoded token
+
+# bot-talk-check-dispatch.sh uses the same bot-talk API IP that already appears
+# throughout the codebase (scheduled-tasks/tasks/bot-talk-poller*.md). The default
+# value is a fallback when BOT_TALK_API_URL env var is unset — not a secret.
+scheduled-tasks/bot-talk-check-dispatch.sh:IP address
+
+# Slack connector onboarding uses a placeholder example email (lobster@yourcompany.com)
+# in setup instructions — not a real email address
+lobster-shop/slack-connector/src/onboarding.py:Email address
+
+# Slack connector onboarding uses STEP_BOT_TOKEN, STEP_APP_TOKEN, STEP_PERSON_TOKEN as
+# step-name identifier strings (wizard state machine steps), not hardcoded credential values
+lobster-shop/slack-connector/src/onboarding.py:Hardcoded token
+
+# find_supply_chain_contacts uses a Chrome User-Agent string containing a fake version
+# number "122.0.0.0" that looks like an IP address — it is not an IP, it is a browser
+# version string used to avoid bot detection in DuckDuckGo HTML requests
+lobster-shop/prospect-enrichment/bin/find_supply_chain_contacts.py:IP address
+
+# lobstertalk-incoming-handler.py uses the same bot-talk API base IP as the already-allowlisted
+# bot-talk-check-dispatch.sh. The BOT_TALK_BASE constant is a fallback when BOT_TALK_API_URL
+# env var is unset — not a secret. The email references are comment-only documentation strings
+# (Google Drive / Gmail account names for context), not credentials.
+scheduled-tasks/lobstertalk-incoming-handler.py:IP address
+scheduled-tasks/lobstertalk-incoming-handler.py:Email address
+

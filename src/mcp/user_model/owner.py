@@ -106,6 +106,17 @@ def write_owner(data: dict[str, Any], owner_file: Path | None = None) -> None:
                 pass
 
 
+def get_owner_timezone(owner_file: Path | None = None) -> str:
+    """Return the owner's IANA timezone string, or 'UTC' if not set.
+
+    Example return values: 'America/Los_Angeles', 'America/New_York', 'Europe/London'.
+    Always returns a non-empty string safe to pass to zoneinfo.ZoneInfo().
+    """
+    data = read_owner(owner_file)
+    tz = data.get("owner", {}).get("timezone", "").strip()
+    return tz if tz else "UTC"
+
+
 def get_owner_name(owner_file: Path | None = None) -> str | None:
     """Return the owner's display name, or None if not set."""
     data = read_owner(owner_file)
@@ -155,7 +166,7 @@ def ensure_owner_toml(
         "owner": {
             "name": name or "unknown",
             "telegram_chat_id": telegram_chat_id or env_chat_id or "",
-        }
+        },
     }
     write_owner(data, path)
     return data

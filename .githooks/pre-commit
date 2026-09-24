@@ -4,6 +4,21 @@
 #
 # Structural backstop — even if .gitignore is wrong, the commit is blocked
 # when staged files match patterns that belong in the workspace, not the repo.
+#
+# Also scans staged file content for personal names (case-insensitive), as
+# configured in ~/lobster-user-config/blocked-names.txt (gitignored, private).
+# If no config file exists, falls back to generic placeholder names below.
+#
+# Allowlisted non-name occurrences:
+#   - Per-name allowlist regex configured alongside each name in blocked-names.txt
+#   - Comments with # noname on the same line — allowed
+#
+# Also warns (with a confirm-to-proceed prompt) when the commit's author or
+# committer email matches a blocklist of known-leaked personal addresses, as
+# configured in ~/lobster-user-config/blocked-commit-emails.txt (gitignored,
+# private). See the "Commit-Author Email Check" section below for details.
+#
+# Bypass: git commit --no-verify
 #===============================================================================
 
 set -uo pipefail
@@ -40,7 +55,9 @@ BLOCKED_EXTENSIONS=(
 # Allowlisted patterns (templates and examples are fine)
 ALLOWLIST_PATTERNS=(
     "memory/canonical-templates/"
+    "scheduled-tasks/tasks/"
     "*.example"
+    "src/integrations/crustdata/"   # false-positive: "crustdata/" contains "data/"
 )
 
 is_allowlisted() {
@@ -112,5 +129,270 @@ if [ "$BLOCKED" -gt 0 ]; then
     echo "To bypass:   git commit --no-verify  (use with caution)"
     exit 1
 fi
+
+#===============================================================================
+# Template Hygiene Tripwire: {{USER_CONFIG_DIR}}/ must stay placeholder-only
+#
+# install.sh copies real user data OUT to $HOME/lobster-user-config (or
+# $LOBSTER_USER_CONFIG) — never back into this in-repo literal directory.
+# This tripwire is a structural backstop in case that ever regresses: any
+# staged file under the literal "{{USER_CONFIG_DIR}}/" path must still look
+# like an unpopulated seed template (i.e. retain at least one
+# "Populated automatically" / "<!--" placeholder marker). If a staged file
+# has lost every placeholder marker, real content was likely written back
+# into the tracked template instead of the private runtime location.
+#===============================================================================
+
+TEMPLATE_VIOLATIONS=0
+
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    case "$file" in
+        '{{USER_CONFIG_DIR}}/'*) ;;
+        *) continue ;;
+    esac
+
+    staged_content="$(git show ":$file" 2>/dev/null || true)"
+    [ -z "$staged_content" ] && continue
+
+    if ! echo "$staged_content" | grep -qE '(Populated automatically|<!--|Auto-generated)'; then
+        echo -e "${RED}${BOLD}BLOCKED${NC} $file"
+        echo "         This file lives under the in-repo {{USER_CONFIG_DIR}}/ seed-template"
+        echo "         directory but no longer contains any placeholder marker — it may"
+        echo "         have been overwritten with real user data instead of staying a template."
+        echo "         Real memory/handoff data belongs in \$HOME/lobster-user-config/, not here."
+        TEMPLATE_VIOLATIONS=$((TEMPLATE_VIOLATIONS + 1))
+    fi
+done <<< "$STAGED_FILES"
+
+if [ "$TEMPLATE_VIOLATIONS" -gt 0 ]; then
+    echo ""
+    echo -e "${RED}${BOLD}Commit blocked: $TEMPLATE_VIOLATIONS templated file(s) under {{USER_CONFIG_DIR}}/ look populated.${NC}"
+    echo "To bypass:   git commit --no-verify  (use with caution)"
+    exit 1
+fi
+
+#===============================================================================
+# Name Check: scan staged diff for personal names
+#===============================================================================
+
+NAME_VIOLATIONS=0
+
+# Load blocked names from user config, falling back to built-in defaults.
+#
+# Config file: ${LOBSTER_USER_CONFIG_DIR:-~/lobster-user-config}/blocked-names.txt
+# Format (one entry per line):
+#   name@@allowlist_regex
+#   - name: the word to block (matched case-insensitively as a whole word)
+#   - allowlist_regex: PCRE — if the full line matches this, the block is suppressed
+#   Lines starting with # are comments; empty lines are ignored.
+#
+# Example:
+#   sahar@@sayhar
+#   drew@@andrew|withdrew|outdrewn
+_NAMES_CONFIG="${LOBSTER_USER_CONFIG_DIR:-$HOME/lobster-user-config}/blocked-names.txt"
+declare -a _BLOCKED_NAMES=()
+if [ -f "$_NAMES_CONFIG" ]; then
+    while IFS= read -r _nc_line; do
+        [[ "$_nc_line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${_nc_line// }" ]] && continue
+        _BLOCKED_NAMES+=("$_nc_line")
+    done < "$_NAMES_CONFIG"
+fi
+# Fallback built-in defaults when no config file exists or it is empty.
+# These are placeholder names, not real ones — real names belong only in
+# the gitignored ~/lobster-user-config/blocked-names.txt (see format above).
+if [ "${#_BLOCKED_NAMES[@]}" -eq 0 ]; then
+    _BLOCKED_NAMES=(
+        'alice@@'
+        'bob@@'
+        'carol@@'
+    )
+fi
+
+scan_staged_diff_for_names() {
+    local diff_output
+    diff_output="$(git diff --cached -U0 2>/dev/null)" || return 0
+    [ -z "$diff_output" ] && return 0
+
+    # Only look at added lines (lines starting with +, not the +++ file headers)
+    local added_lines
+    added_lines="$(echo "$diff_output" | grep -P '^\+(?!\+\+)' | sed 's/^\+//' || true)"
+    [ -z "$added_lines" ] && return 0
+
+    local file_context=""
+    local violations=""
+
+    # Re-read diff to track which file each added line belongs to
+    while IFS= read -r raw_line; do
+        # Track current file
+        if [[ "$raw_line" =~ ^\+\+\+\ b/(.+)$ ]]; then
+            file_context="${BASH_REMATCH[1]}"
+            continue
+        fi
+        # Skip hook files themselves — they contain the patterns as regex strings
+        case "$file_context" in
+            .githooks/*) continue ;;
+        esac
+        # Only process added content lines
+        [[ "$raw_line" =~ ^\+[^+] ]] || continue
+        local content="${raw_line:1}"  # strip leading +
+
+        # Skip lines with inline suppression
+        echo "$content" | grep -qP '#\s*noname\b' && continue
+
+        # Check each blocked name entry
+        for _nc_entry in "${_BLOCKED_NAMES[@]}"; do
+            local _nc_name="${_nc_entry%%@@*}"
+            local _nc_allow=""
+            [[ "$_nc_entry" == *"@@"* ]] && _nc_allow="${_nc_entry#*@@}"
+
+            if echo "$content" | grep -qiP "(?<![a-z])${_nc_name}(?![a-z])" 2>/dev/null; then
+                # Apply allowlist: if line matches the allowlist pattern, suppress
+                if [ -n "$_nc_allow" ] && echo "$content" | grep -qiP "$_nc_allow" 2>/dev/null; then
+                    continue
+                fi
+                violations="${violations}${file_context}: ${content}\n"
+                NAME_VIOLATIONS=$((NAME_VIOLATIONS + 1))
+            fi
+        done
+    done <<< "$diff_output"
+
+    if [ "$NAME_VIOLATIONS" -gt 0 ]; then
+        echo ""
+        echo -e "${RED}${BOLD}Name check failed: staged changes contain personal names.${NC}"
+        echo ""
+        echo "The following lines match restricted name patterns:"
+        echo -e "$violations" | head -10
+        echo ""
+        echo "These names must not appear in committed code."
+        echo "  - Use aliases, roles, or initials instead"
+        echo "  - If this is a legitimate non-name use, add '# noname' to the line"
+        echo "  - To bypass entirely: git commit --no-verify"
+        echo "  - To configure blocked names: edit ~/lobster-user-config/blocked-names.txt"
+        echo ""
+        exit 1
+    fi
+}
+
+scan_staged_diff_for_names
+
+#===============================================================================
+# Commit-Author Email Check: warn on known-leaked personal emails
+#
+# Checks every email address that could end up recorded as this commit's
+# author or committer against a blocklist of known-leaked personal addresses,
+# configured in ~/lobster-user-config/blocked-commit-emails.txt (gitignored,
+# private). If no config file exists, this check is a silent no-op.
+#
+# Config file: ${LOBSTER_USER_CONFIG_DIR:-~/lobster-user-config}/blocked-commit-emails.txt
+# Format (one address per line):
+#   personal@example.com
+#   Lines starting with # are comments; empty lines are ignored. Matching is
+#   case-insensitive exact-address match (no regex).
+#
+# This is a warn + confirm gate, not a hard block — same UX as the PII
+# confirmation prompt in .githooks/pre-push. There can be legitimate reasons
+# to commit under one of these addresses, so this is a habit-breaking nudge,
+# not a lock.
+#
+# Sources checked (covers every way an author/committer email can be set):
+#   - git config user.email        (default author AND committer)
+#   - GIT_AUTHOR_EMAIL              (set by `git commit --author=...`)
+#   - GIT_COMMITTER_EMAIL           (set by `-c user.email=...` overrides)
+#
+# CI / non-interactive mode: if no controlling terminal is available (probed
+# by attempting to open /dev/tty), the warning is printed but the commit is
+# NOT blocked — same policy intent as pre-push's IS_TTY=0 handling. A
+# scripted/automated commit has no one to answer a confirmation prompt, so
+# blocking would just hang forever. (git connects a pre-commit hook's own
+# stdin to /dev/null unconditionally, so checking stdin — as pre-push does —
+# would never detect interactivity here; probing /dev/tty directly is the
+# reliable signal.)
+#
+# Bypass: git commit --no-verify
+#===============================================================================
+
+check_commit_author_email() {
+    local _cae_config="${LOBSTER_USER_CONFIG_DIR:-$HOME/lobster-user-config}/blocked-commit-emails.txt"
+
+    [ -f "$_cae_config" ] || return 0
+
+    local -a _cae_blocked=()
+    local _cae_line _cae_normalized
+    while IFS= read -r _cae_line; do
+        [[ "$_cae_line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${_cae_line// }" ]] && continue
+        _cae_normalized="$(echo "$_cae_line" | tr '[:upper:]' '[:lower:]' | xargs)"
+        [ -z "$_cae_normalized" ] && continue
+        _cae_blocked+=("$_cae_normalized")
+    done < "$_cae_config"
+
+    [ "${#_cae_blocked[@]}" -eq 0 ] && return 0
+
+    local -a _cae_candidates=()
+    local _cae_configured_email
+    _cae_configured_email="$(git config user.email 2>/dev/null || true)"
+    [ -n "$_cae_configured_email" ] && _cae_candidates+=("$_cae_configured_email")
+    [ -n "${GIT_AUTHOR_EMAIL:-}" ] && _cae_candidates+=("$GIT_AUTHOR_EMAIL")
+    [ -n "${GIT_COMMITTER_EMAIL:-}" ] && _cae_candidates+=("$GIT_COMMITTER_EMAIL")
+
+    local _cae_match=""
+    local _cae_candidate _cae_candidate_lc _cae_blocked_email
+    for _cae_candidate in "${_cae_candidates[@]}"; do
+        _cae_candidate_lc="$(echo "$_cae_candidate" | tr '[:upper:]' '[:lower:]')"
+        for _cae_blocked_email in "${_cae_blocked[@]}"; do
+            if [ "$_cae_candidate_lc" = "$_cae_blocked_email" ]; then
+                _cae_match="$_cae_candidate"
+                break 2
+            fi
+        done
+    done
+
+    [ -z "$_cae_match" ] && return 0
+
+    echo ""
+    echo -e "${RED}${BOLD}WARNING: commit author/committer email is on the leaked-email blocklist:${NC}"
+    echo -e "         ${BOLD}${_cae_match}${NC}"
+    echo "         This address has previously leaked into this repo's history."
+    echo "         (configure via ~/lobster-user-config/blocked-commit-emails.txt)"
+    echo ""
+
+    # Non-interactive (CI/scripted) commits: warn but never block — there is
+    # no one to answer a confirmation prompt.
+    #
+    # NOTE: git always connects a pre-commit hook's own stdin (fd 0) to
+    # /dev/null, regardless of whether the invoking shell is interactive —
+    # so `[ -t 0 ]` can never distinguish interactive from non-interactive
+    # here (verified empirically; this differs from pre-push, whose stdin
+    # instead carries the ref-update list). The only reliable signal is
+    # whether a controlling terminal is available at all: try to open
+    # /dev/tty for reading and see if that succeeds.
+    if ! exec 3</dev/tty 2>/dev/null; then
+        echo "No controlling terminal available — proceeding with warning only (not blocking)."
+        echo ""
+        return 0
+    fi
+    exec 3<&-
+
+    read -r -p "Continue committing with this email? [y/N]: " _cae_response </dev/tty
+    _cae_response="${_cae_response:-N}"
+    if [[ "$_cae_response" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+        echo ""
+        echo -e "${GREEN}Confirmed. Proceeding with commit.${NC}"
+        echo ""
+        return 0
+    else
+        echo ""
+        echo -e "${RED}Commit aborted.${NC} Fix your git author config and retry, e.g.:"
+        echo "  git config user.email \"you@example.com\""
+        echo ""
+        echo "Emergency bypass: git commit --no-verify"
+        echo ""
+        return 1
+    fi
+}
+
+check_commit_author_email || exit 1
 
 exit 0

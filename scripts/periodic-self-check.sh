@@ -18,6 +18,17 @@
 
 set -e
 
+# Developer mode: suppress all system notifications so the developer isn't
+# bothered while testing. Real user messages are never affected by this flag.
+_LOBSTER_CONFIG="${LOBSTER_CONFIG_DIR:-$HOME/lobster-config}/config.env"
+if [ -f "$_LOBSTER_CONFIG" ]; then
+    _DEV_MODE=$(grep -m1 '^LOBSTER_DEV_MODE=' "$_LOBSTER_CONFIG" 2>/dev/null | cut -d= -f2)
+    if [ "$_DEV_MODE" = "true" ] || [ "$_DEV_MODE" = "1" ]; then
+        exit 0
+    fi
+fi
+unset _LOBSTER_CONFIG _DEV_MODE
+
 INBOX_DIR="${LOBSTER_MESSAGES:-$HOME/messages}/inbox"
 MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
 STATE_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}/.state"
@@ -87,22 +98,28 @@ if [ -n "$COMPLETED_TASKS" ]; then
     # about what to check.
     SELF_CHECK_TEXT="[Task Completed] ${COMPLETED_TASKS}"
 else
-    # Check pending-agents.json tracker — subagents may have already exited
-    # but still need relay to Drew (processes gone, record still in file).
-    PENDING_AGENTS_FILE="${MESSAGES_DIR}/config/pending-agents.json"
-    PENDING_COUNT=$(python3 -c "
-import json, sys
-try:
-    with open('$PENDING_AGENTS_FILE') as f:
-        data = json.load(f)
-    print(len(data.get('agents', [])))
-except Exception:
-    print(0)
-" 2>/dev/null || echo "0")
+    # Query SQLite agent_sessions DB for pending (running/starting) agents.
+    # pending-agents.json was migrated to SQLite and is no longer authoritative.
+    # Exclude agent_type='dispatcher' — the dispatcher's own session is always
+    # registered as running/starting and would otherwise be counted as a
+    # "pending agent" on every firing, producing a permanent false positive.
+    # DISPATCHER_EXCLUSION_SQL is the shared single source of truth (BIS-723,
+    # scripts/lib/agent_sessions.sh) for this check — it must match
+    # DISPATCHER_EXCLUSION_SQL in src/utils/agent_types.py, used by the
+    # equivalent Python-side checks in session_store.py and inbox_server.py
+    # (see #781 / PR #2099 / PR #2103 for the history of this filter being
+    # fixed independently at each call site before consolidation).
+    source "${LOBSTER_INSTALL_DIR:-$HOME/lobster}/scripts/lib/agent_sessions.sh"
+    PENDING_COUNT=$(sqlite3 "$MESSAGES_DIR/config/agent_sessions.db" \
+        "SELECT COUNT(*) FROM agent_sessions WHERE status IN ('running','starting') AND ${DISPATCHER_EXCLUSION_SQL}" \
+        2>/dev/null || echo "0")
 
     # No completed tasks — only inject status check if subagents are still
-    # running OR there are pending agents in the tracker.
-    if [ "$CLAUDE_COUNT" -le 1 ] && [ "$PENDING_COUNT" -eq 0 ] 2>/dev/null; then
+    # running. The DB session count is authoritative: if there are zero pending
+    # (non-dispatcher) sessions, do nothing. CLAUDE_COUNT is not reliable here
+    # because the dispatcher itself is always running (count >= 1 even with no
+    # subagents).
+    if [ "$PENDING_COUNT" -eq 0 ] 2>/dev/null; then
         exit 0
     fi
 
@@ -121,18 +138,19 @@ TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.%6N)
 EPOCH_MS=$(date +%s%3N)
 MSG_ID="${EPOCH_MS}_self"
 
-cat > "${INBOX_DIR}/${MSG_ID}.json" << EOF
-{
-  "id": "${MSG_ID}",
-  "source": "system",
-  "chat_id": 0,
-  "user_id": 0,
-  "username": "lobster-system",
-  "user_name": "Self-Check",
-  "text": "${SELF_CHECK_TEXT}",
-  "timestamp": "${TIMESTAMP}"
-}
-EOF
+# Shared jq --arg JSON builder (BIS-724, scripts/lib/json_message.sh) — single
+# source of truth for jq-arg-safe JSON construction, see PR history for #2004.
+source "${LOBSTER_INSTALL_DIR:-$HOME/lobster}/scripts/lib/json_message.sh"
+_json_build_message \
+    --arg id "${MSG_ID}" \
+    --arg source "system" \
+    --argjson chat_id 0 \
+    --argjson user_id 0 \
+    --arg username "lobster-system" \
+    --arg user_name "Self-Check" \
+    --arg text "${SELF_CHECK_TEXT}" \
+    --arg timestamp "${TIMESTAMP}" \
+    > "${INBOX_DIR}/${MSG_ID}.json"
 
 # Record timestamp
 date +%s > "$LAST_CHECK_FILE"

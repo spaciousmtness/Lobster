@@ -22,37 +22,53 @@ Lobster transforms a server into an always-on Claude Code hub that:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                  🦞 LOBSTER CORE (tmux)                     │
-│         Long-running Claude Code session in tmux            │
-│         Blocks on wait_for_messages() - infinite loop       │
-│                                                             │
-│   MCP Server: lobster-inbox                                 │
-│   - Message queue management                                │
-│   - Task tracking                                           │
-│   - Scheduled job management                                │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                   🦞 LOBSTER DISPATCHER (tmux)                    │
+│         Stateless main loop — runs forever in tmux               │
+│         Blocks on wait_for_messages(); routes messages in <7s    │
+│                                                                   │
+│  7-second rule: anything taking longer goes to a subagent        │
+│    → Task(subagent_type=..., run_in_background=True)             │
+│    → register_agent(agent_id, chat_id, ...)  [SQLite tracking]   │
+│    → Subagent calls write_result() when done                     │
+│    → Dispatcher forwards result or drops if already delivered    │
+│                                                                   │
+│  Skill system: composable context layers loaded per message      │
+│    → always / triggered / contextual activation modes           │
+│                                                                   │
+│  Brain-dump routing: voice notes → brain-dumps subagent          │
+│    → transcribe_audio() → detect brain dump → GitHub issue       │
+│                                                                   │
+│   MCP Server: lobster-inbox                                       │
+│   - Message queue (check_inbox, mark_processing, mark_processed) │
+│   - Task tracking (create_task, update_task, list_tasks)         │
+│   - Scheduled job management                                      │
+│   - Agent session store (register_agent, get_active_sessions)    │
+│   - Subagent result bus (write_result, write_observation)        │
+└──────────────────────────────────────────────────────────────────┘
                               ↑↓
                ~/messages/inbox/ ←→ ~/messages/outbox/
+               ~/messages/processing/ (claimed messages)
+               ~/messages/config/agent_sessions.db (SQLite)
                               ↑↓
-┌─────────────────────────────────────────────────────────────┐
-│              TELEGRAM BOT (lobster-router)                  │
-│   Writes incoming messages to inbox                         │
-│   Watches outbox and sends replies                          │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│              TELEGRAM BOT (lobster-router)                        │
+│   Writes incoming messages to inbox                               │
+│   Watches outbox and sends replies                                │
+└──────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────┐
-│              SLACK BOT (lobster-slack-router)               │
-│   Receives messages via Socket Mode                         │
-│   Writes to inbox, sends replies from outbox                │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│              SLACK BOT (lobster-slack-router)                     │
+│   Receives messages via Socket Mode                               │
+│   Writes to inbox, sends replies from outbox                      │
+└──────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────┐
-│              SCHEDULED TASKS (Cron)                         │
-│   Automated jobs run on schedule                            │
-│   Each job spawns a fresh Claude instance                   │
-│   Outputs go to ~/messages/task-outputs/                    │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│              SCHEDULED TASKS (Cron)                               │
+│   Automated jobs run on schedule                                  │
+│   Each job spawns a fresh Claude subagent instance                │
+│   Outputs go to ~/messages/task-outputs/                          │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Prerequisites
@@ -197,6 +213,20 @@ lobster test       # Create test message
 lobster help       # Show help
 ```
 
+## Telegram Slash Commands
+
+Commands you can send directly in the Telegram chat:
+
+| Command | Description |
+|---------|-------------|
+| `/report <description>` | File a bug report or feedback. Creates a record in Lobster's report store that can be reviewed with `list_reports`. |
+
+## Telegram Reactions
+
+React to any Lobster message with an emoji to send a signal. Reactions are buffered for 5 seconds — removing the reaction within that window cancels it.
+
+Reactions arrive as inbox messages with `type: "reaction"` and include the raw emoji. The dispatcher decides what to do with it.
+
 ## Directory Structure
 
 ```
@@ -205,13 +235,12 @@ lobster help       # Show help
 │   ├── bot/lobster_bot.py     # Telegram bot
 │   ├── mcp/inbox_server.py    # MCP server
 │   └── cli                    # CLI tool
-├── scripts/
+├── scripts/                   # 30+ utility scripts for operations
 │   └── claude-wrapper.exp     # Expect script for Claude startup
 ├── scheduled-tasks/           # Scheduled jobs system
-│   ├── jobs.json              # Job registry
 │   ├── tasks/                 # Task markdown files
 │   ├── logs/                  # Execution logs
-│   ├── run-job.sh             # Task executor
+│   ├── dispatch-job.sh        # Task dispatcher (posts to inbox)
 │   └── sync-crontab.sh        # Crontab synchronizer
 ├── services/                  # systemd units
 ├── config/                    # Configuration
@@ -226,6 +255,8 @@ lobster help       # Show help
 
 ~/lobster-workspace/           # Claude workspace (the brain)
 ├── CLAUDE.md                  # System context
+├── scheduled-jobs/            # Scheduled job configuration
+│   └── jobs.json              # Job registry
 ├── projects/                  # All Lobster-managed projects
 │   └── [project-name]/        # Each project in its own directory
 └── logs/                      # Log files
@@ -239,12 +270,23 @@ All projects cloned or created by Lobster live in `~/lobster-workspace/projects/
 
 The lobster-inbox MCP server provides:
 
-### Message Queue
-- `check_inbox(source?, limit?)` - Get new messages
-- `send_reply(chat_id, text, source?)` - Send a reply
+### Message Queue (Dispatcher)
+- `wait_for_messages(timeout?, hibernate_on_timeout?)` - Block until messages arrive (dispatcher only)
+- `check_inbox(source?, limit?)` - Non-blocking inbox check
+- `send_reply(chat_id, text, source?, message_id?, task_id?)` - Send a reply (pass `message_id` to atomically mark processed)
+- `mark_processing(message_id)` - Claim a message before processing
 - `mark_processed(message_id)` - Mark message handled
+- `mark_failed(message_id, error?)` - Mark message failed (auto-retried with backoff)
 - `list_sources()` - List available channels
 - `get_stats()` - Inbox statistics
+
+### Subagent Result Bus
+- `write_result(task_id, chat_id, text, sent_reply_to_user?, status?)` - Return a result from a background subagent. Pass `sent_reply_to_user=True` if already called `send_reply` directly.
+- `write_observation(chat_id, text, category, task_id?)` - Write a side-channel observation (user_context, system_context, system_error)
+
+### Agent Session Tracking (SQLite)
+- `register_agent(agent_id, description, chat_id, source?, output_file?, timeout_minutes?)` - Register a running subagent; survives restarts
+- `get_active_sessions()` - List all running/recently completed subagent sessions
 
 ### Voice Transcription
 - `transcribe_audio(message_id)` - Transcribe voice messages using local whisper.cpp (small model). Fully local, no cloud API needed.
@@ -267,7 +309,7 @@ Create recurring automated tasks that run on a cron schedule:
 - `write_task_output(job_name, output, status?)` - Write job output (used by job instances)
 
 ### GitHub Integration
-Access GitHub repositories, issues, PRs, and projects via the GitHub MCP server:
+Access GitHub repositories, issues, PRs, and projects via the `gh` CLI:
 - Browse and search code across repositories
 - Create, update, and manage issues
 - Review pull requests and add comments
@@ -276,27 +318,17 @@ Access GitHub repositories, issues, PRs, and projects via the GitHub MCP server:
 
 ## GitHub Integration
 
-Lobster integrates with GitHub via the official GitHub MCP server. This allows directing work through GitHub issues and project boards.
+Lobster uses the `gh` CLI for all GitHub operations. The `gh` CLI is installed and authenticated during setup — no additional configuration is needed.
 
 ### Setup
 
-During installation, you'll be prompted for a GitHub Personal Access Token. Or configure manually:
-
-```bash
-# Create a PAT at https://github.com/settings/tokens with scopes: repo, read:org, read:project
-
-# Add the GitHub MCP server
-claude mcp add-json github '{"type":"http","url":"https://api.githubcopilot.com/mcp","headers":{"Authorization":"Bearer YOUR_PAT"}}'
-
-# Verify
-claude mcp list
-```
+During installation, Lobster installs the `gh` CLI and prompts you to authenticate with `gh auth login`. All GitHub operations use this authenticated CLI session.
 
 ### Usage Examples
 
 ```
 User: "Check my GitHub issues"
-Lobster: Uses mcp__github tools to list and summarize issues
+Lobster: Uses gh CLI to list and summarize issues
 
 User: "Work on issue #42"
 Lobster: Reads issue details, implements solution, comments on progress
@@ -376,9 +408,23 @@ Manual control:
 sudo systemctl status lobster-router
 sudo systemctl status lobster-slack-router  # if Slack enabled
 sudo systemctl status lobster-claude
-tmux -L lobster list-sessions          # Check tmux session
-lobster attach                          # Attach to Claude session
+tmux -L lobster list-sessions              # Check tmux session
+lobster attach                              # Attach to Claude session
 ```
+
+## Upgrading
+
+Already running Lobster? Pull the latest changes and rerun the installer:
+
+```bash
+cd ~/lobster
+git pull origin main
+./install.sh
+```
+
+The installer is idempotent — it updates scripts and services without touching your existing config, tokens, or message history.
+
+For a full step-by-step guide including lobster-watcher redeployment, DB migration verification, and rollback instructions, see [docs/upgrading.md](docs/upgrading.md).
 
 ## Slack Integration
 
@@ -386,8 +432,8 @@ To add Slack as a message source, see [docs/SLACK-SETUP.md](docs/SLACK-SETUP.md)
 
 ## Security
 
-- 🔐 Bot restricted to allowed user IDs only
-- 🔒 Credentials stored in config.env (gitignored)
+- 🔒 Bot restricted to allowed user IDs only
+- 🔐 Credentials stored in config.env (gitignored)
 - 🛡️ No hardcoded secrets in code
 - 🦞 Hard shell, soft on the inside
 

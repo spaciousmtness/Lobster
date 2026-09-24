@@ -23,7 +23,7 @@ Depends on: schema.py, db.py, emotional_model.py, narrative.py, self_knowledge.p
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -139,7 +139,7 @@ def sync_index(conn: Any, base: Path) -> bool:
     lines = [
         "# User Model Index",
         "",
-        f"*Last synced: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}*",
+        f"*Last synced: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}*",
         "",
         "## Model Stats",
         "",
@@ -174,6 +174,9 @@ def sync_index(conn: Any, base: Path) -> bool:
     lines.append("- [Blind Spots](blind-spots.md)")
     lines.append("- [Contradictions](contradictions.md)")
     lines.append("- [Attention Stack](attention.md)")
+    lines.append("- [Activity Rhythm](rhythm.md)")
+    lines.append("- [Value Drift](drift.md)")
+    lines.append("- [Context Summary](_context.md)")
 
     return _write_file(base / "_index.md", "\n".join(lines))
 
@@ -247,6 +250,25 @@ def sync_all(
     except Exception as e:
         errors.append(f"attention: {e}")
 
+    # Activity rhythm
+    try:
+        from .rhythm import format_rhythm_markdown
+        content = format_rhythm_markdown(conn)
+        if _write_file(base / "rhythm.md", content):
+            files_written += 1
+    except Exception as e:
+        errors.append(f"rhythm: {e}")
+
+    # Drift summary
+    try:
+        from .temporal import get_drift_summary_for_reflect
+        drift_text = get_drift_summary_for_reflect(conn)
+        if drift_text:
+            if _write_file(base / "drift.md", f"# Value Drift\n\n{drift_text}\n"):
+                files_written += 1
+    except Exception as e:
+        errors.append(f"drift: {e}")
+
     # Index
     try:
         if sync_index(conn, base):
@@ -258,7 +280,7 @@ def sync_all(
         "base_dir": str(base),
         "files_written": files_written,
         "errors": errors,
-        "synced_at": datetime.utcnow().isoformat(),
+        "synced_at": datetime.now(timezone.utc).isoformat(),
     }
 
 

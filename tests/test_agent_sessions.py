@@ -1,0 +1,1258 @@
+"""
+Smoke tests for agent session tracking (BIS-51).
+
+Tests:
+  - session_store: full lifecycle, task_id matching, history queries
+  - tracker adapter: public API unchanged over SQLite backend
+  - format_active_sessions_block: compact display helper
+"""
+
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import time as _time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+# Ensure src is on path
+SRC_DIR = Path(__file__).parent.parent / "src"
+sys.path.insert(0, str(SRC_DIR))
+
+from agents import session_store
+
+# Placeholder string used as a test chat_id value. Several tests pass this as
+# a bare name (not a quoted string literal), so it must be defined here.
+OWNER_CHAT_ID_PLACEHOLDER = "OWNER_CHAT_ID_PLACEHOLDER"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def isolated_db(tmp_path):
+    """Each test gets its own fresh SQLite DB and isolated session_store state.
+
+    Closes any cached connection after each test to prevent state leakage.
+    """
+    db_path = tmp_path / "test_sessions.db"
+    session_store.init_db(db_path)
+    yield db_path
+    session_store._close_connection(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Test: full lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_full_lifecycle(isolated_db):
+    """Start a session, verify active, end it, verify history."""
+    db = isolated_db
+
+    # Initially no active sessions
+    assert session_store.get_active_sessions(path=db) == []
+
+    # Start a session
+    session_store.session_start(
+        id="test-001",
+        description="Test agent doing work",
+        chat_id="OWNER_CHAT_ID_PLACEHOLDER",
+        agent_type="general-purpose",
+        path=db,
+    )
+
+    # Verify it shows as active
+    active = session_store.get_active_sessions(path=db)
+    assert len(active) == 1
+    assert active[0]["id"] == "test-001"
+    assert active[0]["status"] == "running"
+    assert active[0]["description"] == "Test agent doing work"
+    assert active[0]["chat_id"] == "OWNER_CHAT_ID_PLACEHOLDER"
+    assert active[0]["agent_type"] == "general-purpose"
+    assert "elapsed_seconds" in active[0]
+    assert active[0]["elapsed_seconds"] >= 0
+
+    # End it
+    session_store.session_end("test-001", "completed", "Task done.", path=db)
+
+    # Verify active is now empty
+    assert session_store.get_active_sessions(path=db) == []
+
+    # Verify history includes it
+    history = session_store.get_session_history(limit=10, path=db)
+    assert len(history) == 1
+    assert history[0]["id"] == "test-001"
+    assert history[0]["status"] == "completed"
+    assert history[0]["result_summary"] == "Task done."
+    assert history[0]["completed_at"] is not None
+
+
+def test_task_id_matching(isolated_db):
+    """session_end matches on task_id when id is not provided."""
+    db = isolated_db
+
+    session_store.session_start(
+        id="test-002",
+        description="X",
+        chat_id="123",
+        task_id="my-task-id",
+        path=db,
+    )
+
+    # End by task_id (not the agent id)
+    session_store.session_end("my-task-id", "failed", path=db)
+
+    # Verify by looking up the session by id
+    result = session_store.find_session("test-002", path=db)
+    assert result is not None
+    assert result["status"] == "failed"
+    assert result["task_id"] == "my-task-id"
+
+
+def test_find_session_by_id(isolated_db):
+    db = isolated_db
+    session_store.session_start(id="agent-abc", description="Find me", chat_id="999", path=db)
+    found = session_store.find_session("agent-abc", path=db)
+    assert found is not None
+    assert found["id"] == "agent-abc"
+    assert found["status"] == "running"
+
+
+def test_find_session_by_task_id(isolated_db):
+    db = isolated_db
+    session_store.session_start(
+        id="agent-xyz", description="Find by task", chat_id="999",
+        task_id="task-abc-123", path=db
+    )
+    found = session_store.find_session("task-abc-123", path=db)
+    assert found is not None
+    assert found["id"] == "agent-xyz"
+
+
+def test_find_session_not_found(isolated_db):
+    db = isolated_db
+    result = session_store.find_session("nonexistent", path=db)
+    assert result is None
+
+
+def test_session_end_idempotent(isolated_db):
+    """Ending a non-existent session is a no-op (no exception)."""
+    db = isolated_db
+    # Should not raise
+    session_store.session_end("does-not-exist", "completed", path=db)
+
+
+def test_session_end_does_not_double_close(isolated_db):
+    """session_end only updates running sessions; completed sessions are unaffected."""
+    db = isolated_db
+    session_store.session_start(id="test-003", description="Y", chat_id="123", path=db)
+    session_store.session_end("test-003", "completed", "First close", path=db)
+
+    # Second close should not change result_summary
+    session_store.session_end("test-003", "failed", "Second close", path=db)
+
+    result = session_store.find_session("test-003", path=db)
+    assert result["status"] == "completed"
+    assert result["result_summary"] == "First close"
+
+
+def test_session_end_closes_starting_row(isolated_db):
+    """session_end closes rows with status='starting' (auto-registered by PostToolUse hook).
+
+    The auto-register-agent.py hook inserts rows as 'starting' before the agent
+    has fully initialised. Previously, session_end only matched 'running' rows,
+    so write_result calls on 'starting' rows were silently no-ops and the rows
+    accumulated indefinitely. This test verifies the fix: session_end now accepts
+    both 'running' and 'starting'.
+    """
+    import sqlite3
+    db = isolated_db
+    conn = sqlite3.connect(str(db))
+    # Insert a 'starting' row directly — mimics the PostToolUse hook
+    conn.execute(
+        """
+        INSERT INTO agent_sessions
+            (id, task_id, agent_type, description, chat_id, source, status, spawned_at)
+        VALUES
+            (?, ?, 'subagent', 'auto-registered by PostToolUse hook', '123', 'telegram',
+             'starting', datetime('now'))
+        """,
+        ("hook-agent-id", "hook-task-id"),
+    )
+    conn.commit()
+    conn.close()
+
+    # End by task_id (as write_result does)
+    session_store.session_end("hook-task-id", "completed", "Done.", path=db)
+
+    result = session_store.find_session("hook-task-id", path=db)
+    assert result is not None
+    assert result["status"] == "completed"
+    assert result["completed_at"] is not None
+    assert result["result_summary"] == "Done."
+
+
+def test_multiple_sessions(isolated_db):
+    """Multiple concurrent sessions are tracked independently."""
+    db = isolated_db
+    for i in range(5):
+        session_store.session_start(
+            id=f"agent-{i}",
+            description=f"Agent {i}",
+            chat_id="123",
+            agent_type="general-purpose",
+            path=db,
+        )
+
+    active = session_store.get_active_sessions(path=db)
+    assert len(active) == 5
+
+    # End two of them
+    session_store.session_end("agent-1", "completed", path=db)
+    session_store.session_end("agent-3", "failed", path=db)
+
+    active = session_store.get_active_sessions(path=db)
+    assert len(active) == 3
+    active_ids = {s["id"] for s in active}
+    assert "agent-1" not in active_ids
+    assert "agent-3" not in active_ids
+
+
+def test_session_history_limit(isolated_db):
+    db = isolated_db
+    for i in range(10):
+        session_store.session_start(id=f"h-{i}", description="X", chat_id="0", path=db)
+        session_store.session_end(f"h-{i}", "completed", path=db)
+
+    history = session_store.get_session_history(limit=5, path=db)
+    assert len(history) == 5
+
+
+def test_session_history_status_filter(isolated_db):
+    db = isolated_db
+    session_store.session_start(id="ok-1", description="A", chat_id="0", path=db)
+    session_store.session_end("ok-1", "completed", path=db)
+    session_store.session_start(id="fail-1", description="B", chat_id="0", path=db)
+    session_store.session_end("fail-1", "failed", path=db)
+    session_store.session_start(id="running-1", description="C", chat_id="0", path=db)
+
+    completed = session_store.get_session_history(status="completed", path=db)
+    assert all(s["status"] == "completed" for s in completed)
+    assert any(s["id"] == "ok-1" for s in completed)
+
+    failed = session_store.get_session_history(status="failed", path=db)
+    assert all(s["status"] == "failed" for s in failed)
+
+    running = session_store.get_session_history(status="running", path=db)
+    assert any(s["id"] == "running-1" for s in running)
+
+
+def test_session_start_replaces_duplicate_id(isolated_db):
+    """INSERT OR REPLACE handles duplicate IDs gracefully."""
+    db = isolated_db
+    session_store.session_start(id="dup", description="First", chat_id="123", path=db)
+    session_store.session_start(id="dup", description="Second", chat_id="456", path=db)
+
+    found = session_store.find_session("dup", path=db)
+    assert found is not None
+    assert found["description"] == "Second"
+
+    active = session_store.get_active_sessions(path=db)
+    assert len(active) == 1
+
+
+def test_optional_fields(isolated_db):
+    """Optional fields default to None without error."""
+    db = isolated_db
+    session_store.session_start(
+        id="minimal",
+        description="Minimal session",
+        chat_id="OWNER_CHAT_ID_PLACEHOLDER",  # int chat_id gets converted to str
+        path=db,
+    )
+    found = session_store.find_session("minimal", path=db)
+    assert found is not None
+    assert found["agent_type"] is None
+    assert found["task_id"] is None
+    assert found["output_file"] is None
+    assert found["timeout_minutes"] is None
+    assert found["chat_id"] == "OWNER_CHAT_ID_PLACEHOLDER"  # stored as TEXT
+
+
+# ---------------------------------------------------------------------------
+# Test: format_active_sessions_block
+# ---------------------------------------------------------------------------
+
+
+def test_format_active_sessions_block_empty():
+    result = session_store.format_active_sessions_block([])
+    assert result == ""
+
+
+def test_format_active_sessions_block_single():
+    sessions = [{
+        "id": "abc",
+        "agent_type": "functional-engineer",
+        "description": "Implement feature X",
+        "chat_id": "OWNER_CHAT_ID_PLACEHOLDER",
+        "elapsed_seconds": 720,
+        "status": "running",
+    }]
+    result = session_store.format_active_sessions_block(sessions)
+    assert "[1 agent running]" in result
+    assert "functional-engineer" in result
+    assert "Implement feature X" in result
+    assert "12m ago" in result
+
+
+def test_format_active_sessions_block_multiple():
+    sessions = [
+        {"agent_type": "functional-engineer", "description": "Work A",
+         "chat_id": "123", "elapsed_seconds": 720, "id": "1"},
+        {"agent_type": "general-purpose", "description": "Work B",
+         "chat_id": "123", "elapsed_seconds": 120, "id": "2"},
+    ]
+    result = session_store.format_active_sessions_block(sessions)
+    assert "[2 agents running]" in result
+    assert "functional-engineer" in result
+    assert "general-purpose" in result
+
+
+def test_format_truncates_long_description():
+    sessions = [{
+        "agent_type": "agent",
+        "description": "A" * 100,
+        "chat_id": "0",
+        "elapsed_seconds": 60,
+        "id": "x",
+    }]
+    result = session_store.format_active_sessions_block(sessions)
+    # Description should be truncated
+    assert "..." in result
+
+
+def test_format_system_agent_separated_from_user_count():
+    """System agents (chat_id=0) must not inflate the user-facing agent count."""
+    sessions = [
+        {"agent_type": "subagent", "description": "User task",
+         "chat_id": "ADMIN_CHAT_ID_REDACTED", "elapsed_seconds": 300, "id": "u1"},
+        {"agent_type": "subagent", "description": "startup-catchup",
+         "chat_id": "0", "elapsed_seconds": 60, "id": "s1"},
+    ]
+    result = session_store.format_active_sessions_block(sessions)
+    # User count should be 1, not 2
+    assert "[1 agent running" in result
+    # System count annotation
+    assert "1 system" in result
+    # System agent shown with 'system' label, not chat_id
+    assert "(system," in result
+    # User agent shown with real chat_id
+    assert "chat: ADMIN_CHAT_ID_REDACTED" in result
+
+
+def test_format_plural_system_agents():
+    """Two system agents should show '2 systems' (not '2 system')."""
+    sessions = [
+        {"agent_type": "subagent", "description": "startup-catchup",
+         "chat_id": "0", "elapsed_seconds": 60, "id": "s1"},
+        {"agent_type": "subagent", "description": "health-check",
+         "chat_id": 0, "elapsed_seconds": 30, "id": "s2"},
+    ]
+    result = session_store.format_active_sessions_block(sessions)
+    assert "2 systems" in result, f"Expected '2 systems' in output, got: {result!r}"
+    assert "2 system]" not in result, "Singular 'system' must not appear with count 2"
+
+
+def test_format_only_system_agents():
+    """When only system agents are running, header shows 0 user agents + N system."""
+    sessions = [
+        {"agent_type": "subagent", "description": "startup-catchup",
+         "chat_id": 0, "elapsed_seconds": 60, "id": "s1"},
+    ]
+    result = session_store.format_active_sessions_block(sessions)
+    assert "[0 agents running, 1 system]" in result
+    assert "(system," in result
+
+
+# ---------------------------------------------------------------------------
+# Test: tracker.py adapter compatibility
+# ---------------------------------------------------------------------------
+
+
+def test_tracker_adapter_compat(isolated_db):
+    """tracker.py public API must work unchanged over SQLite backend.
+
+    Note: tracker.py uses the module-level default DB path, not the test path.
+    We prime the session_store with an init_db call using the test path,
+    then test the tracker functions against that same DB.
+    """
+    # Import tracker after session_store is initialized
+    from agents.tracker import (
+        add_pending_agent,
+        remove_pending_agent,
+        get_pending_agents,
+        is_agent_pending,
+        pending_agent_count,
+    )
+
+    db = isolated_db
+
+    # Test add
+    add_pending_agent("a1", "Do thing", 123456, path=db)
+    assert is_agent_pending("a1", path=db)
+    assert pending_agent_count(path=db) == 1
+
+    # Test multiple
+    add_pending_agent("a2", "Other thing", 789012, task_id="task-xyz", path=db)
+    assert pending_agent_count(path=db) == 2
+
+    # Test list
+    agents = get_pending_agents(path=db)
+    assert len(agents) == 2
+    ids = {a["id"] for a in agents}
+    assert "a1" in ids
+    assert "a2" in ids
+
+    # Test remove
+    remove_pending_agent("a1", path=db)
+    assert not is_agent_pending("a1", path=db)
+    assert pending_agent_count(path=db) == 1
+
+    # Remove remaining
+    remove_pending_agent("a2", path=db)
+    assert get_pending_agents(path=db) == []
+
+
+def test_tracker_remove_nonexistent_is_noop(isolated_db):
+    """Removing a non-existent agent is idempotent (no exception)."""
+    from agents.tracker import remove_pending_agent, is_agent_pending
+
+    db = isolated_db
+    remove_pending_agent("no-such-agent", path=db)
+    assert not is_agent_pending("no-such-agent", path=db)
+
+
+def test_tracker_add_with_all_params(isolated_db):
+    """add_pending_agent supports all optional params without error."""
+    from agents.tracker import add_pending_agent, get_pending_agents
+
+    db = isolated_db
+    add_pending_agent(
+        agent_id="full-agent",
+        description="Full params test",
+        chat_id="OWNER_CHAT_ID_PLACEHOLDER",
+        task_id="task-full-001",
+        source="telegram",
+        output_file="/tmp/claude-1000/tasks/full-agent.output",
+        timeout_minutes=30,
+        path=db,
+    )
+    agents = get_pending_agents(path=db)
+    assert len(agents) == 1
+    a = agents[0]
+    assert a["id"] == "full-agent"
+    assert a["task_id"] == "task-full-001"
+    assert a["output_file"] == "/tmp/claude-1000/tasks/full-agent.output"
+    assert a["timeout_minutes"] == 30
+
+
+# ---------------------------------------------------------------------------
+# Test: JSON migration
+# ---------------------------------------------------------------------------
+
+
+def test_json_migration(tmp_path):
+    """pending-agents.json is migrated to SQLite on init_db()."""
+    import json
+
+    db_path = tmp_path / "sessions.db"
+    json_path = tmp_path / "pending-agents.json"
+
+    # Write a pending-agents.json in the same directory as the DB
+    agents_data = {
+        "agents": [
+            {
+                "id": "migrated-001",
+                "description": "Migrated agent",
+                "chat_id": "OWNER_CHAT_ID_PLACEHOLDER",
+                "source": "telegram",
+                "started_at": "2026-03-15T10:00:00+00:00",
+                "status": "running",
+            }
+        ]
+    }
+    json_path.write_text(json.dumps(agents_data))
+
+    # init_db should migrate the JSON
+    session_store.init_db(db_path)
+
+    # Verify migration
+    active = session_store.get_active_sessions(path=db_path)
+    assert len(active) == 1
+    assert active[0]["id"] == "migrated-001"
+    assert active[0]["description"] == "Migrated agent"
+
+    # JSON file should be renamed to .migrated
+    migrated_marker = tmp_path / "pending-agents.json.migrated"
+    assert migrated_marker.exists()
+    assert not json_path.exists()
+
+    # Cleanup
+    session_store._close_connection(db_path)
+
+
+def test_json_migration_idempotent(tmp_path):
+    """Migration is not re-run if .migrated marker exists."""
+    import json
+
+    db_path = tmp_path / "sessions.db"
+    json_path = tmp_path / "pending-agents.json"
+    migrated_marker = tmp_path / "pending-agents.json.migrated"
+
+    # Pre-create the migrated marker (simulates already-migrated system)
+    migrated_marker.write_text("{}")
+
+    # Write a fresh JSON — should be ignored because .migrated exists
+    agents_data = {"agents": [{"id": "should-not-migrate", "description": "X",
+                                "chat_id": "0", "started_at": "2026-03-15T10:00:00+00:00"}]}
+    json_path.write_text(json.dumps(agents_data))
+
+    session_store.init_db(db_path)
+
+    # No migration should have happened
+    active = session_store.get_active_sessions(path=db_path)
+    assert len(active) == 0
+
+    # Original JSON file should still exist (not renamed again)
+    assert json_path.exists()
+
+    session_store._close_connection(db_path)
+
+
+def test_json_migration_missing_json_is_noop(tmp_path):
+    """init_db with no pending-agents.json is a no-op (no error)."""
+    db_path = tmp_path / "sessions.db"
+    session_store.init_db(db_path)  # No JSON file — should succeed
+    active = session_store.get_active_sessions(path=db_path)
+    assert active == []
+    session_store._close_connection(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Test: cleanup_stale_running_sessions (issue #510)
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_stale_running_no_output_file(isolated_db):
+    """Session with no output_file and elapsed > timeout_minutes is marked dead."""
+    db = isolated_db
+
+    # Spawn a session with a timeout of 1 minute, spawned_at 120 minutes ago
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=120)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, description, chat_id, source, status, spawned_at, timeout_minutes)
+        VALUES ('stale-no-file', 'Old agent', '123', 'telegram', 'running', ?, 60)
+        """,
+        (old_spawned_at,),
+    )
+    session_store._get_connection(db).commit()
+
+    server_start = datetime.now(timezone.utc)
+    dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "stale-no-file" in dead
+    result = session_store.find_session("stale-no-file", path=db)
+    assert result["status"] == "dead"
+
+
+def test_cleanup_stale_running_output_missing(isolated_db, tmp_path):
+    """Session whose output_file does not exist is marked dead after the grace period.
+
+    The session must have been spawned more than 2 minutes ago for the missing-file
+    rule to fire.  Sessions spawned within 2 minutes are left running (see
+    test_cleanup_stale_running_output_missing_within_grace_period).
+    """
+    db = isolated_db
+    missing_path = str(tmp_path / "nonexistent.output")
+
+    # Insert a session with spawned_at well in the past (5 minutes ago) so that
+    # the 2-minute grace period has already elapsed.
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, description, chat_id, source, status, spawned_at, output_file)
+        VALUES ('stale-missing-file', 'Agent with missing output', '123', 'telegram',
+                'running', ?, ?)
+        """,
+        (old_spawned_at, missing_path),
+    )
+    session_store._get_connection(db).commit()
+
+    server_start = datetime.now(timezone.utc)
+    dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "stale-missing-file" in dead
+    result = session_store.find_session("stale-missing-file", path=db)
+    assert result["status"] == "dead"
+    assert "missing" in result["result_summary"]
+
+
+def test_cleanup_stale_running_output_missing_within_grace_period(isolated_db, tmp_path):
+    """Session with missing output_file is left running within the 2-minute grace period.
+
+    The output_file for a freshly-spawned agent may not exist yet (Claude Code creates
+    it after the first tool turn).  If the MCP server restarts within 2 minutes of
+    spawning, the startup cleanup must not mark the session dead prematurely.
+    """
+    db = isolated_db
+    missing_path = str(tmp_path / "not_yet_created.output")
+
+    session_store.session_start(
+        id="fresh-missing-file",
+        description="Newly spawned agent — output file not yet created",
+        chat_id="123",
+        output_file=missing_path,
+        path=db,
+    )
+
+    # Server restarts 30 seconds after spawn — well within the 2-minute grace period.
+    server_start = datetime.now(timezone.utc) + timedelta(seconds=30)
+    dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "fresh-missing-file" not in dead, (
+        "Freshly-spawned agent should NOT be killed within the 2-minute grace period "
+        "even if its output_file is missing"
+    )
+    result = session_store.find_session("fresh-missing-file", path=db)
+    assert result["status"] == "running"
+
+
+def test_cleanup_stale_running_output_tool_use_left_running(isolated_db, tmp_path):
+    """Session whose output_file has stop_reason=tool_use is left running after restart.
+
+    Previously the mtime-based check would mark this agent dead if the file
+    predated the server start time. The fix reads stop_reason instead: tool_use
+    means the agent may still be alive, so we leave it running (issue #645).
+    """
+    db = isolated_db
+    output_file = tmp_path / "live_agent.output"
+    output_file.write_text('{"stop_reason": "tool_use"}\n')
+
+    # Set mtime to 10 minutes ago to simulate a file that predates server start.
+    # Under the old logic this would have been killed; under the new logic it stays.
+    old_ts = _time.time() - 600
+    os.utime(str(output_file), (old_ts, old_ts))
+
+    session_store.session_start(
+        id="live-tool-use",
+        description="Agent with tool_use output (may still be alive)",
+        chat_id="123",
+        output_file=str(output_file),
+        path=db,
+    )
+
+    # Server started 5 minutes ago — file mtime predates it, but stop_reason=tool_use
+    server_start = datetime.now(timezone.utc) - timedelta(minutes=5)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "live-tool-use" not in changed, (
+        "Agent with stop_reason=tool_use should NOT be killed — it may still be alive"
+    )
+    result = session_store.find_session("live-tool-use", path=db)
+    assert result["status"] == "running"
+
+
+def test_cleanup_stale_running_output_end_turn_marked_completed(isolated_db, tmp_path):
+    """Session whose output_file has stop_reason=end_turn is marked completed at startup.
+
+    If an agent finished before or during a server restart, its output file
+    contains stop_reason=end_turn. The startup cleanup should mark it completed
+    (not dead) so the notification message says 'completed' not 'dead'.
+    """
+    db = isolated_db
+    output_file = tmp_path / "finished_agent.output"
+    output_file.write_text('{"stop_reason": "end_turn"}\n')
+
+    session_store.session_start(
+        id="finished-agent",
+        description="Agent that finished",
+        chat_id="123",
+        output_file=str(output_file),
+        path=db,
+    )
+
+    server_start = datetime.now(timezone.utc)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "finished-agent" in changed
+    result = session_store.find_session("finished-agent", path=db)
+    assert result["status"] == "completed"
+    assert "end_turn" in result["result_summary"]
+
+
+def test_cleanup_stale_running_skips_fresh_file(isolated_db, tmp_path):
+    """Session whose output_file has stop_reason=tool_use is left running.
+
+    Regardless of mtime, a file with tool_use means the agent may be alive.
+    """
+    db = isolated_db
+    output_file = tmp_path / "fresh_agent.output"
+    output_file.write_text('{"stop_reason": "tool_use"}\n')
+
+    server_start = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    session_store.session_start(
+        id="fresh-agent",
+        description="Fresh running agent",
+        chat_id="123",
+        output_file=str(output_file),
+        path=db,
+    )
+
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "fresh-agent" not in changed
+    result = session_store.find_session("fresh-agent", path=db)
+    assert result["status"] == "running"
+
+
+def test_cleanup_stale_running_no_op_when_empty(isolated_db):
+    """cleanup_stale_running_sessions returns empty list when no running sessions."""
+    db = isolated_db
+    server_start = datetime.now(timezone.utc)
+    dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
+    assert dead == []
+
+
+def test_cleanup_stale_running_skips_no_file_within_timeout(isolated_db):
+    """Session with no output_file but spawned recently (within timeout) is skipped."""
+    db = isolated_db
+
+    # Spawned 30 minutes ago, timeout=120 minutes — not yet over threshold
+    recent_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, description, chat_id, source, status, spawned_at, timeout_minutes)
+        VALUES ('recent-no-file', 'Recent agent', '123', 'telegram', 'running', ?, 120)
+        """,
+        (recent_spawned_at,),
+    )
+    session_store._get_connection(db).commit()
+
+    server_start = datetime.now(timezone.utc)
+    dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "recent-no-file" not in dead
+    result = session_store.find_session("recent-no-file", path=db)
+    assert result["status"] == "running"
+
+
+def test_cleanup_stale_running_oserror_marks_dead(isolated_db, tmp_path):
+    """Session whose output_file raises OSError is marked dead after the grace period."""
+    db = isolated_db
+    # Use a path inside a non-existent directory to provoke OSError on resolve/stat.
+    # Path.resolve() on a dangling path inside a missing parent dir can raise OSError
+    # on some filesystems; we simulate by patching Path.resolve to raise.
+    import unittest.mock as mock
+
+    output_path = str(tmp_path / "unreadable.output")
+
+    # Insert with spawned_at 5 minutes ago so the 2-minute grace period has elapsed.
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, description, chat_id, source, status, spawned_at, output_file)
+        VALUES ('oserror-agent', 'Agent with unreadable output', '123', 'telegram',
+                'running', ?, ?)
+        """,
+        (old_spawned_at, output_path),
+    )
+    session_store._get_connection(db).commit()
+
+    # Patch Path.resolve to raise OSError for this specific path
+    original_resolve = Path.resolve
+
+    def patched_resolve(self, **kwargs):
+        if str(self) == output_path:
+            raise OSError("Permission denied (simulated)")
+        return original_resolve(self, **kwargs)
+
+    with mock.patch.object(Path, "resolve", patched_resolve):
+        server_start = datetime.now(timezone.utc)
+        dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "oserror-agent" in dead
+    result = session_store.find_session("oserror-agent", path=db)
+    assert result["status"] == "dead"
+    # _read_stop_reason_from_path returns "missing" for OSError (path unresolvable),
+    # so the result_summary says "output_file missing" (not "unreadable")
+    assert "missing" in result["result_summary"]
+
+
+def test_cleanup_stale_running_null_spawned_at_no_output_file_skips_with_warning(
+    isolated_db, caplog
+):
+    """Session with no output_file AND no spawned_at stays running and logs a warning.
+
+    The current schema has spawned_at NOT NULL, so this combination cannot arise
+    through normal inserts. The warning branch is defensive code for future schema
+    changes or direct DB manipulation. We test it by patching the DB cursor to
+    return a synthetic row with both fields set to None.
+    """
+    import logging
+    import unittest.mock as mock
+
+    db = isolated_db
+    server_start = datetime.now(timezone.utc)
+
+    # Build a fake row dict that looks like what the cursor would return
+    fake_row = {
+        "id": "null-everything",
+        "output_file": None,
+        "spawned_at": None,
+        "timeout_minutes": None,
+        "pid": None,
+        "dispatcher_pid": None,
+    }
+
+    # Patch _get_connection to return a mock whose .execute().fetchall() returns our row
+    mock_cursor = mock.MagicMock()
+    mock_cursor.fetchall.return_value = [fake_row]
+    mock_conn = mock.MagicMock()
+    mock_conn.execute.return_value = mock_cursor
+
+    with mock.patch.object(session_store, "_get_connection", return_value=mock_conn):
+        with caplog.at_level(logging.WARNING, logger="agents.session_store"):
+            dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    # Row has no actionable info — should not be marked dead
+    assert "null-everything" not in dead
+
+    # Should have logged a warning about the uncleanable row
+    assert any("null-everything" in record.message for record in caplog.records)
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_reconciler_check_output_file_status_running_for_stuck_tool_use(tmp_path):
+    """check_output_file_status returns 'running' for a file with stop_reason=tool_use.
+
+    This exercises the precondition for the reconciler's 60-min dead-threshold
+    branch: a file stuck at tool_use is treated as 'running', not 'missing' or
+    'done', so the normal 25-min threshold does not fire and only the 60-min
+    threshold applies.
+    """
+    output_file = tmp_path / "stuck_agent.output"
+    # JSONL with last stop_reason = tool_use (simulating mid-turn stuck state)
+    output_file.write_text(
+        '{"type": "result", "stop_reason": "tool_use", "subtype": "tool_use"}\n'
+    )
+
+    status = session_store.check_output_file_status(str(output_file))
+    assert status == "running", (
+        f"Expected 'running' for tool_use output file, got {status!r}"
+    )
+
+
+def test_reconciler_check_output_file_status_done_for_end_turn(tmp_path):
+    """check_output_file_status returns 'done' for a file with stop_reason=end_turn."""
+    output_file = tmp_path / "finished_agent.output"
+    output_file.write_text(
+        '{"type": "result", "stop_reason": "end_turn", "subtype": "end_turn"}\n'
+    )
+
+    status = session_store.check_output_file_status(str(output_file))
+    assert status == "done", (
+        f"Expected 'done' for end_turn output file, got {status!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: startup cleanup leaves tool_use agents running (issue #645 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_stale_does_not_kill_agents_surviving_restart(isolated_db, tmp_path):
+    """Agents with stop_reason=tool_use survive server restarts unchanged.
+
+    Regression test for issue #645: the old mtime-based heuristic marked agents
+    dead whenever their output file predated the server start time — which happens
+    on every restart for any running agent. The fix reads stop_reason instead:
+    tool_use means the agent may still be alive.
+    """
+    db = isolated_db
+    output_file = tmp_path / "surviving_agent.output"
+    output_file.write_text('{"stop_reason": "tool_use"}\n')
+
+    # Backdate mtime to simulate a file that predates the server restart
+    old_ts = _time.time() - 3600  # 1 hour ago
+    os.utime(str(output_file), (old_ts, old_ts))
+
+    session_store.session_start(
+        id="surviving-agent",
+        description="Agent that was running when server restarted",
+        chat_id="123",
+        output_file=str(output_file),
+        path=db,
+    )
+
+    # Server started just now — clearly after the file's mtime
+    server_start = datetime.now(timezone.utc)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "surviving-agent" not in changed, (
+        "Agent with stop_reason=tool_use must NOT be killed at startup "
+        "(it may have survived the server restart)"
+    )
+    result = session_store.find_session("surviving-agent", path=db)
+    assert result["status"] == "running", (
+        f"Expected 'running' but got {result['status']!r}"
+    )
+
+
+def test_cleanup_stale_marks_end_turn_as_completed_not_dead(isolated_db, tmp_path):
+    """Agents with stop_reason=end_turn are marked completed (not dead) at startup.
+
+    Regression test for issue #645: previously only the mtime path existed,
+    so an agent that finished before a restart would be left in limbo (mtime
+    newer than server start → skipped; but the reconciler would eventually
+    catch it). Now the startup cleanup proactively marks it completed.
+    """
+    db = isolated_db
+    output_file = tmp_path / "completed_agent.output"
+    output_file.write_text('{"stop_reason": "end_turn"}\n')
+
+    session_store.session_start(
+        id="completed-at-restart",
+        description="Agent that finished before restart",
+        chat_id="123",
+        output_file=str(output_file),
+        path=db,
+    )
+
+    server_start = datetime.now(timezone.utc)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "completed-at-restart" in changed
+    result = session_store.find_session("completed-at-restart", path=db)
+    assert result["status"] == "completed", (
+        f"Expected 'completed' for end_turn agent but got {result['status']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: dispatcher-exclusion (Linear BIS-723)
+#
+# The dispatcher's own row (agent_type='dispatcher') has output_file legitimately
+# NULL and no natural completion — it must never be swept up by the startup
+# cleanup or re-notified as a failed/completed agent. Regression coverage for
+# the shared predicate in src/utils/agent_types.py (issue #781 / PR #2099 /
+# PR #2103 — fixed independently at each call site before consolidation).
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_stale_running_excludes_dispatcher_row(isolated_db):
+    """cleanup_stale_running_sessions must never mark the dispatcher's own row dead.
+
+    A dispatcher row has no output_file and no natural completion signal, so
+    without the exclusion it would be treated like an orphaned subagent and
+    marked dead purely due to elapsed time.
+    """
+    db = isolated_db
+
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=200)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, agent_type, description, chat_id, source, status, spawned_at)
+        VALUES ('dispatcher-main-loop', 'dispatcher', 'main dispatcher loop',
+                '0', 'telegram', 'running', ?)
+        """,
+        (old_spawned_at,),
+    )
+    session_store._get_connection(db).commit()
+
+    server_start = datetime.now(timezone.utc)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "dispatcher-main-loop" not in changed
+    result = session_store.find_session("dispatcher-main-loop", path=db)
+    assert result["status"] == "running"
+
+
+def test_get_unnotified_completed_excludes_dispatcher_row(isolated_db):
+    """get_unnotified_completed must never surface the dispatcher's own row.
+
+    Belt-and-suspenders guard: even if the dispatcher's row were ever marked
+    completed/dead with notified_at NULL, the startup sweep must not re-notify
+    it as a failed agent.
+    """
+    db = isolated_db
+
+    completed_at = datetime.now(timezone.utc).isoformat()
+    spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, agent_type, description, chat_id, source, status, spawned_at, completed_at)
+        VALUES ('dispatcher-main-loop', 'dispatcher', 'main dispatcher loop',
+                '0', 'telegram', 'dead', ?, ?)
+        """,
+        (spawned_at, completed_at),
+    )
+    session_store._get_connection(db).commit()
+
+    unnotified = session_store.get_unnotified_completed(since_hours=24, path=db)
+
+    assert all(row["id"] != "dispatcher-main-loop" for row in unnotified)
+
+
+# ---------------------------------------------------------------------------
+# PID ground truth (issue #2148 — Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _spawn_and_kill_pid() -> int:
+    """Spawn a real subprocess, kill and reap it, return its now-dead PID.
+
+    Used to build the 'dead-PID simulation' required by the issue's
+    acceptance criteria — a PID that is guaranteed not to be alive, without
+    relying on any live Lobster process.
+    """
+    proc = subprocess.Popen(["sleep", "30"])
+    pid = proc.pid
+    proc.kill()
+    proc.wait()
+    return pid
+
+
+def test_session_start_persists_pid_and_dispatcher_pid(isolated_db):
+    """session_start() persists pid/dispatcher_pid and stamps pid_captured_at."""
+    db = isolated_db
+
+    session_store.session_start(
+        id="pid-test-1",
+        description="Docker-worker style agent with a real PID",
+        chat_id="123",
+        pid=54321,
+        dispatcher_pid=99999,
+        path=db,
+    )
+
+    result = session_store.find_session("pid-test-1", path=db)
+    assert result["pid"] == 54321
+    assert result["dispatcher_pid"] == 99999
+    assert result["pid_captured_at"] is not None
+
+
+def test_session_start_pid_fields_default_to_null(isolated_db):
+    """Callers that don't pass pid/dispatcher_pid get NULL — fully backward compatible."""
+    db = isolated_db
+
+    session_store.session_start(
+        id="pid-test-2",
+        description="Agent-tool subagent with no real PID of its own",
+        chat_id="123",
+        path=db,
+    )
+
+    result = session_store.find_session("pid-test-2", path=db)
+    assert result["pid"] is None
+    assert result["dispatcher_pid"] is None
+    assert result["pid_captured_at"] is None
+
+
+def test_cleanup_stale_running_dead_pid_overrides_tool_use_file(isolated_db, tmp_path):
+    """A confirmed-dead pid marks the session dead even with a 'still running' output file.
+
+    Required acceptance criterion: simulate a dead PID (spawn subprocess, kill
+    it) and confirm the classifier now correctly reports dead even when the
+    output_file's stop_reason (tool_use) would previously have left it
+    running, and even with an artificially fresh mtime.
+    """
+    db = isolated_db
+    dead_pid = _spawn_and_kill_pid()
+
+    output_file = tmp_path / "docker_worker.output"
+    output_file.write_text('{"stop_reason": "tool_use"}\n')
+    # Artificially fresh mtime — under the old mtime-only heuristic this would
+    # have looked alive. The current code already ignores mtime in favor of
+    # stop_reason parsing, so we additionally verify the *stop_reason* signal
+    # (tool_use == "may still be alive") is overridden by the dead pid.
+    now_ts = _time.time()
+    os.utime(str(output_file), (now_ts, now_ts))
+
+    session_store.session_start(
+        id="dead-pid-agent",
+        description="docker-worker job whose process has actually exited",
+        chat_id="123",
+        output_file=str(output_file),
+        pid=dead_pid,
+        path=db,
+    )
+
+    server_start = datetime.now(timezone.utc)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "dead-pid-agent" in changed, (
+        "A dead pid must override the tool_use/fresh-mtime heuristic and mark "
+        "the session dead"
+    )
+    result = session_store.find_session("dead-pid-agent", path=db)
+    assert result["status"] == "dead"
+    assert str(dead_pid) in result["result_summary"]
+
+
+def test_cleanup_stale_running_live_pid_overrides_stale_missing_file(isolated_db, tmp_path):
+    """A confirmed-live pid leaves the session running even with a missing/stale output file.
+
+    Required acceptance criterion: a live, long-running subprocess with a
+    deliberately stale/absent output_file — which would previously cause a
+    false dead/'ghost' classification via the elapsed-time fallback — must be
+    correctly reported alive because the pid check overrides that heuristic.
+    """
+    db = isolated_db
+    live_proc = subprocess.Popen(["sleep", "30"])
+    try:
+        missing_path = str(tmp_path / "never_created.output")
+
+        # Spawned long enough ago, with no output_file, that the old
+        # elapsed-time fallback (timeout_minutes default 120) would have
+        # marked this dead.
+        old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=200)).isoformat()
+        session_store._get_connection(db).execute(
+            """
+            INSERT INTO agent_sessions
+                (id, description, chat_id, source, status, spawned_at,
+                 output_file, timeout_minutes, pid)
+            VALUES ('live-pid-agent', 'Long-running docker-worker job', '123',
+                    'telegram', 'running', ?, ?, 60, ?)
+            """,
+            (old_spawned_at, missing_path, live_proc.pid),
+        )
+        session_store._get_connection(db).commit()
+
+        server_start = datetime.now(timezone.utc)
+        changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+        assert "live-pid-agent" not in changed, (
+            "A live pid must override the missing-output-file/elapsed-time "
+            "heuristic and leave the session running"
+        )
+        result = session_store.find_session("live-pid-agent", path=db)
+        assert result["status"] == "running"
+    finally:
+        live_proc.kill()
+        live_proc.wait()
+
+
+def test_cleanup_stale_running_dead_dispatcher_pid_marks_subagent_dead(isolated_db, tmp_path):
+    """A confirmed-dead dispatcher_pid marks an in-process subagent row dead.
+
+    If the dispatcher process itself is confirmed dead, every Agent-tool
+    subagent registered under it (dispatcher_pid, no pid of its own) is
+    necessarily dead too — regardless of what its output_file suggests.
+    """
+    db = isolated_db
+    dead_dispatcher_pid = _spawn_and_kill_pid()
+
+    output_file = tmp_path / "subagent.output"
+    output_file.write_text('{"stop_reason": "tool_use"}\n')
+
+    session_store.session_start(
+        id="orphaned-subagent",
+        description="Agent-tool subagent whose dispatcher has died",
+        chat_id="123",
+        output_file=str(output_file),
+        dispatcher_pid=dead_dispatcher_pid,
+        path=db,
+    )
+
+    server_start = datetime.now(timezone.utc)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "orphaned-subagent" in changed
+    result = session_store.find_session("orphaned-subagent", path=db)
+    assert result["status"] == "dead"
+    assert "dispatcher" in result["result_summary"].lower()
+
+
+def test_cleanup_stale_running_live_dispatcher_pid_falls_back_to_existing_heuristics(
+    isolated_db, tmp_path
+):
+    """A live dispatcher_pid does not itself prove the subagent is alive.
+
+    dispatcher_pid alive only rules out the 'dispatcher is dead' shortcut —
+    it must fall back to the existing output_file heuristics for the
+    subagent's own liveness, unchanged from pre-PID behavior.
+    """
+    db = isolated_db
+    live_dispatcher_proc = subprocess.Popen(["sleep", "30"])
+    try:
+        missing_path = str(tmp_path / "missing.output")
+        old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        session_store._get_connection(db).execute(
+            """
+            INSERT INTO agent_sessions
+                (id, description, chat_id, source, status, spawned_at,
+                 output_file, dispatcher_pid)
+            VALUES ('subagent-under-live-dispatcher', 'Subagent', '123',
+                    'telegram', 'running', ?, ?, ?)
+            """,
+            (old_spawned_at, missing_path, live_dispatcher_proc.pid),
+        )
+        session_store._get_connection(db).commit()
+
+        server_start = datetime.now(timezone.utc)
+        changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+        # Same outcome as the pre-existing missing-file-past-grace-period
+        # heuristic (test_cleanup_stale_running_output_missing): dead.
+        assert "subagent-under-live-dispatcher" in changed
+        result = session_store.find_session("subagent-under-live-dispatcher", path=db)
+        assert result["status"] == "dead"
+        assert "missing" in result["result_summary"]
+    finally:
+        live_dispatcher_proc.kill()
+        live_dispatcher_proc.wait()
+
+
+def test_cleanup_stale_running_zero_pid_rows_unaffected(isolated_db):
+    """Rows with no pid/dispatcher_pid (pre-migration rows) behave exactly as before.
+
+    Regression guard required by the acceptance criteria: identical scenario
+    and assertions to test_cleanup_stale_running_no_output_file, which
+    predates the pid columns entirely.
+    """
+    db = isolated_db
+
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=120)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, description, chat_id, source, status, spawned_at, timeout_minutes)
+        VALUES ('zero-pid-stale', 'Old agent, no pid columns', '123', 'telegram',
+                'running', ?, 60)
+        """,
+        (old_spawned_at,),
+    )
+    session_store._get_connection(db).commit()
+
+    server_start = datetime.now(timezone.utc)
+    dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "zero-pid-stale" in dead
+    result = session_store.find_session("zero-pid-stale", path=db)
+    assert result["status"] == "dead"
+    assert result["pid"] is None
+    assert result["dispatcher_pid"] is None

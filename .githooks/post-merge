@@ -1,0 +1,92 @@
+#!/bin/bash
+#===============================================================================
+# Post-Merge Hook: Queue upgrade instructions to Lobster inbox
+#
+# After `git pull` (which triggers post-merge), this hook writes a system
+# message to ~/messages/inbox/ so that the running Claude Code session sees
+# it on the next wait_for_messages() poll and knows to run the upgrade.
+#
+# Rate limit: at most one upgrade message per COOLDOWN_SECONDS (600 = 10 min).
+# This prevents floods when many branches are pulled or rebased in quick
+# succession (e.g. local-dev rebuild merging 10 PRs writes 10+ post-merge
+# events in under 2 minutes).  A single upgrade reminder is enough to prompt
+# the dispatcher to run uv pip install -e .
+#===============================================================================
+
+MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
+INBOX_DIR="$MESSAGES_DIR/inbox"
+
+# Only proceed if the inbox directory exists (i.e. Lobster is installed)
+if [ ! -d "$INBOX_DIR" ]; then
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Rate-limit guard: skip if we already queued a message within the cooldown
+# window.  The state file stores the epoch second of the last queued message.
+# ---------------------------------------------------------------------------
+COOLDOWN_SECONDS=600  # 10 minutes
+STATE_DIR="${LOBSTER_MESSAGES:-$HOME/messages}/config"
+RATE_LIMIT_FILE="$STATE_DIR/upgrade-hook-last-ts"
+
+NOW=$(date +%s)
+
+if [ -f "$RATE_LIMIT_FILE" ]; then
+    LAST_TS=$(cat "$RATE_LIMIT_FILE" 2>/dev/null || echo 0)
+    # Use arithmetic expansion; treat non-numeric values as 0
+    LAST_TS=$(( LAST_TS + 0 ))
+    ELAPSED=$(( NOW - LAST_TS ))
+    if [ "$ELAPSED" -lt "$COOLDOWN_SECONDS" ]; then
+        echo "[post-merge] Skipping upgrade reminder (last sent ${ELAPSED}s ago, cooldown=${COOLDOWN_SECONDS}s)."
+        exit 0
+    fi
+fi
+
+# Record the current timestamp before writing (atomic enough for a hook — no
+# parallel writers expected here, and worst case is one extra message, not a
+# flood).
+mkdir -p "$STATE_DIR"
+echo "$NOW" > "$RATE_LIMIT_FILE"
+
+TIMESTAMP=$(date +%s%3N)
+MSG_FILE="$INBOX_DIR/${TIMESTAMP}_upgrade.json"
+
+cat > "$MSG_FILE" << EOF
+{
+  "id": "${TIMESTAMP}_upgrade",
+  "source": "system",
+  "chat_id": "system",
+  "type": "system",
+  "text": "System upgrade: dependencies may have changed after git pull. Run: cd ~/lobster && uv pip install -e . — or for a full upgrade: uv pip install -e '.[slack]'",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.%6N)"
+}
+EOF
+
+echo "[post-merge] Queued dependency upgrade reminder to Lobster inbox."
+
+# ---------------------------------------------------------------------------
+# Hook-wiring drift reconciliation (issue #2249 — "disappearing agent problem")
+#
+# Hooks added to install.sh's setup_claude_hooks() after an instance's initial
+# install previously never reached that instance: this git-pull upgrade path
+# only ever queued the reminder above (which just runs `uv pip install -e .`)
+# and never re-ran install.sh or any settings.json reconciliation. Confirmed
+# live: hooks/auto-register-agent.py sat completely unwired for an unknown
+# period as a direct result, causing spawned background agents to leave zero
+# trace anywhere the moment anything went wrong.
+#
+# reconcile-claude-hooks.py is a small, idempotent, self-contained script
+# (deliberately not a refactor of setup_claude_hooks()) that re-applies a
+# short list of CRITICAL hooks to settings.json if missing. Run it here, on
+# every git pull, so hook-wiring drift can never silently persist again.
+# Best-effort: never blocks the merge, never fails the hook.
+# ---------------------------------------------------------------------------
+LOBSTER_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
+RECONCILE_SCRIPT="$LOBSTER_DIR/scripts/reconcile-claude-hooks.py"
+if [ -f "$RECONCILE_SCRIPT" ]; then
+    if command -v uv >/dev/null 2>&1; then
+        uv run "$RECONCILE_SCRIPT" 2>&1 | sed 's/^/[post-merge] /' || true
+    else
+        python3 "$RECONCILE_SCRIPT" 2>&1 | sed 's/^/[post-merge] /' || true
+    fi
+fi

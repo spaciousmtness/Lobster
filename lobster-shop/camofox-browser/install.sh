@@ -54,16 +54,37 @@ echo ""
 step "Checking prerequisites"
 
 # Check Node.js
+# Note: Node 21+ is required because the camofox-browser server's dependencies
+# use the "import ... with" syntax (import attributes), which was introduced in
+# Node.js 21. Earlier versions will fail at startup with a SyntaxError.
+# We install Node 22 LTS (the current LTS line that meets this requirement).
+_install_node22() {
+    info "Installing Node.js 22 LTS via NodeSource..."
+    if ! command -v curl &>/dev/null; then
+        error "curl is required to install Node.js automatically. Install curl and retry."
+        exit 1
+    fi
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+    sudo apt-get update -qq
+    sudo apt-get install -y nodejs
+}
+
 if ! command -v node &>/dev/null; then
-    error "Node.js is required but not installed."
-    echo "  Install with: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install -y nodejs"
-    exit 1
+    warn "Node.js is not installed. Installing Node 22 LTS automatically..."
+    _install_node22
 fi
 
 NODE_VERSION=$(node --version | sed 's/v//' | cut -d. -f1)
-if [ "$NODE_VERSION" -lt 18 ]; then
-    error "Node.js >= 18 required, found $(node --version)"
-    exit 1
+if [ "$NODE_VERSION" -lt 21 ]; then
+    warn "Node.js >= 21 required (found $(node --version)). Installing Node 22 LTS automatically..."
+    _install_node22
+    # Refresh NODE_VERSION after upgrade
+    NODE_VERSION=$(node --version | sed 's/v//' | cut -d. -f1)
+    if [ "$NODE_VERSION" -lt 21 ]; then
+        error "Node.js upgrade failed. Please install Node 22 LTS manually:"
+        echo "  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs"
+        exit 1
+    fi
 fi
 success "Node.js found: $(node --version)"
 
@@ -115,6 +136,15 @@ step "Installing Node.js dependencies"
 
 cd "$SERVER_DIR"
 npm install --production 2>&1 | tail -5
+
+# Rebuild native addons (better-sqlite3) from source to match the current Node
+# binary. Pre-built binaries for better-sqlite3 are compiled against the Ubuntu
+# system libnode (libnode.so.109, i.e. Node 18), which does not exist when Node
+# is installed from NodeSource as a static binary. Building from source compiles
+# against the installed node headers with static linkage, so no libnode.so is
+# required at runtime.
+info "Rebuilding native addons from source for Node $(node --version)..."
+npm rebuild better-sqlite3 --build-from-source 2>&1 | tail -5
 success "Node.js dependencies installed"
 
 info "Fetching Camoufox browser engine (this may take a minute on first run)..."
@@ -231,6 +261,25 @@ else
     warn "Could not register MCP server automatically."
     echo "  Register manually with:"
     echo "  claude mcp add camofox-browser -s user -- $PYTHON_PATH $SRC_DIR/camofox_mcp_server.py"
+fi
+
+#===============================================================================
+# Step 9: Activate the skill in Lobster's skill manager
+#===============================================================================
+step "Activating skill in Lobster"
+
+ACTIVATE_SCRIPT="
+import sys
+sys.path.insert(0, '$LOBSTER_DIR/src')
+from mcp.skill_manager import activate_skill
+result = activate_skill('camofox-browser', mode='always')
+print(result)
+"
+
+if "$PYTHON_PATH" -c "$ACTIVATE_SCRIPT" 2>/dev/null; then
+    success "Skill activated: camofox-browser (mode: always)"
+else
+    warn "Could not auto-activate skill. Run: lobster skill activate camofox-browser"
 fi
 
 #===============================================================================

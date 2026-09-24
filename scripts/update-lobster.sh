@@ -43,13 +43,36 @@ MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
 LOBSTER_CONFIG_DIR="${LOBSTER_CONFIG_DIR:-$HOME/lobster-config}"
 CONFIG_FILE="$LOBSTER_CONFIG_DIR/config.env"
 
-# Lock file
-LOCK_FILE="/tmp/lobster-update.lock"
+# Lock file (overridable for test isolation; production default unchanged)
+LOCK_FILE="${LOBSTER_UPDATE_LOCK_FILE:-/tmp/lobster-update.lock}"
 
-# Services (in stop order - daemon first, then router)
-SERVICES_STOP=("lobster-daemon" "lobster-router")
+#-------------------------------------------------------------------------------
+# Services
+#
+# lobster-claude is deliberately EXCLUDED from SERVICES_STOP/SERVICES_START
+# (issue #2179). This script is normally invoked via a Bash tool call from
+# inside the live lobster-claude dispatcher session itself, which makes its
+# own process tree a descendant of lobster-claude.service's cgroup. Stopping
+# lobster-claude mid-flow (as the old code did, first, via SERVICES_STOP)
+# tears down that whole cgroup -- including this very script -- before
+# git_update()/update_dependencies()/update_systemd() or the mcp-local/router
+# restart ever run. systemd's Restart=on-failure then silently brings
+# lobster-claude back up, which looks like "update finished" but nothing
+# after the "Stopping lobster-claude..." log line ever executed.
+#
+# Fix: lobster-claude is never stopped/started as part of the normal
+# stop-work-start cycle. Only lobster-mcp-local and lobster-router (which are
+# NOT the cgroup this script runs in) are cycled mid-flow. lobster-claude is
+# bounced via restart_self_last() as the literal last statement of main(),
+# after every meaningful step (git update, deps, systemd regen, CLI update,
+# mcp-local/router restart, health checks, success notification, lock
+# cleanup) has already completed -- so if this process dies right there, the
+# update has already actually happened.
+#-------------------------------------------------------------------------------
+SERVICE_SELF="lobster-claude"
+SERVICES_STOP=("lobster-mcp-local" "lobster-router")
 # Start order is reversed
-SERVICES_START=("lobster-router" "lobster-daemon")
+SERVICES_START=("lobster-router" "lobster-mcp-local")
 
 # State files to backup
 STATE_FILES=(
@@ -221,8 +244,10 @@ create_backup() {
         claude --version 2>/dev/null > "$BACKUP_DIR/claude-version.txt" || echo "unknown" > "$BACKUP_DIR/claude-version.txt"
     fi
 
-    # Save service states
-    for service in "${SERVICES_STOP[@]}"; do
+    # Save service states (SERVICES_STOP plus lobster-claude, which is
+    # handled separately by restart_self_last() -- see comment at the
+    # SERVICES_STOP/SERVICES_START declaration)
+    for service in "${SERVICES_STOP[@]}" "$SERVICE_SELF"; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
             echo "active" > "$BACKUP_DIR/${service}.state"
         else
@@ -240,35 +265,16 @@ create_backup() {
 stop_services() {
     log STEP "Stopping services"
 
+    # NOTE: lobster-claude is never in this array -- see comment at the
+    # SERVICES_STOP declaration. It is handled separately, last, by
+    # restart_self_last().
     for service in "${SERVICES_STOP[@]}"; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
             if $DRY_RUN; then
                 log INFO "Would stop $service"
             else
                 log INFO "Stopping $service..."
-
-                # For daemon, wait for Claude to finish current work
-                if [ "$service" = "lobster-daemon" ]; then
-                    # Send SIGTERM and wait up to 60 seconds
-                    sudo systemctl stop "$service" --no-block 2>/dev/null || true
-
-                    local wait_count=0
-                    while systemctl is-active --quiet "$service" 2>/dev/null && [ $wait_count -lt 60 ]; do
-                        sleep 1
-                        ((wait_count++))
-                        if [ $((wait_count % 10)) -eq 0 ]; then
-                            log INFO "Waiting for daemon to finish... (${wait_count}s)"
-                        fi
-                    done
-
-                    if systemctl is-active --quiet "$service" 2>/dev/null; then
-                        log WARN "Daemon didn't stop gracefully, forcing..."
-                        sudo systemctl kill "$service" 2>/dev/null || true
-                        sleep 2
-                    fi
-                else
-                    sudo systemctl stop "$service" 2>/dev/null || true
-                fi
+                sudo systemctl stop "$service" 2>/dev/null || true
 
                 if ! systemctl is-active --quiet "$service" 2>/dev/null; then
                     log OK "$service stopped"
@@ -311,6 +317,39 @@ start_services() {
         return 1
     fi
     return 0
+}
+
+#-------------------------------------------------------------------------------
+# Restart self (lobster-claude) -- LAST, on purpose (issue #2179)
+#
+# Must only ever be called after every other meaningful step has already
+# completed: git update, deps, systemd regen, CLI update, mcp-local/router
+# restart, health checks, success notification, and lock cleanup. By the
+# time this runs, there is nothing left that this process dying mid-flight
+# could leave incomplete.
+#
+# Uses --no-block deliberately: this call may itself trigger the cgroup
+# teardown that kills the very process making the call (when invoked from
+# inside the live lobster-claude session), so it must not wait around for a
+# result. systemd's Restart=on-failure (or the graceful stop/start pair this
+# triggers) brings lobster-claude back up on its own with the newly updated
+# code.
+#-------------------------------------------------------------------------------
+restart_self_last() {
+    log STEP "Restarting $SERVICE_SELF (last step)"
+
+    if $DRY_RUN; then
+        log INFO "Would restart $SERVICE_SELF"
+        return 0
+    fi
+
+    if systemctl is-active --quiet "$SERVICE_SELF" 2>/dev/null; then
+        log INFO "Restarting $SERVICE_SELF..."
+        sudo systemctl restart "$SERVICE_SELF" --no-block 2>/dev/null || true
+    else
+        log INFO "Starting $SERVICE_SELF..."
+        sudo systemctl start "$SERVICE_SELF" --no-block 2>/dev/null || true
+    fi
 }
 
 #-------------------------------------------------------------------------------
@@ -418,38 +457,110 @@ update_claude_cli() {
 
 #-------------------------------------------------------------------------------
 # Systemd update
+#
+# Always regenerates service files from their repo templates and reinstalls
+# them to /etc/systemd/system/. This corrects any divergence between the
+# installed service files and the repo templates — including manual edits
+# that are invisible to git (lobster-claude.service is not tracked in git —
+# it is generated at install/update time from lobster-claude.service.template
+# into a runtime directory, never back into the repo's services/ dir).
+#
+# Uses the same {{PLACEHOLDER}} substitution logic as install.sh.
 #-------------------------------------------------------------------------------
 
 update_systemd() {
-    log STEP "Checking systemd services"
+    log STEP "Reinstalling systemd service files from templates"
 
     cd "$LOBSTER_DIR"
 
-    # Check if service files changed
-    local changed=false
-    if git diff --name-only "$PREVIOUS_COMMIT..HEAD" 2>/dev/null | grep -q "services/"; then
-        changed=true
+    # Map update-lobster.sh variables to the canonical LOBSTER_* names
+    # expected by scripts/lib/template.sh.  This is the single implementation
+    # of generate_from_template — do not duplicate the sed block here.
+    LOBSTER_USER="${LOBSTER_USER:-${USER:-$(whoami)}}"
+    LOBSTER_GROUP="${LOBSTER_GROUP:-$LOBSTER_USER}"
+    LOBSTER_HOME="${LOBSTER_HOME:-$HOME}"
+    LOBSTER_INSTALL_DIR="$LOBSTER_DIR"
+    LOBSTER_WORKSPACE="$WORKSPACE_DIR"
+    LOBSTER_MESSAGES="$MESSAGES_DIR"
+    # LOBSTER_CONFIG_DIR is already set at the top of this script
+    # NOTE: "${LOBSTER_USER_CONFIG:-default}" only falls back when the var is
+    # UNSET/EMPTY. This script runs as a child of lobster-claude.service (or is
+    # invoked from a shell that inherited its environment); if that unit's
+    # Environment=LOBSTER_USER_CONFIG=... line still has the raw
+    # {{USER_CONFIG_DIR}} placeholder, the bad value is "set" and defeats the
+    # fallback, silently re-poisoning every service file update_systemd()
+    # regenerates. Sanitize before applying the default.
+    case "${LOBSTER_USER_CONFIG:-}" in
+        *'{{'*) unset LOBSTER_USER_CONFIG ;;
+    esac
+    LOBSTER_USER_CONFIG="${LOBSTER_USER_CONFIG:-${LOBSTER_HOME}/lobster-user-config}"
+
+    # Source the shared template library (repo is present — we just pulled it).
+    # shellcheck source=lib/template.sh
+    source "${LOBSTER_DIR}/scripts/lib/template.sh"
+
+    # Thin wrapper: delegates to _tmpl_generate_from_template and emits the
+    # update-lobster.sh log OK line for consistency with other log calls.
+    generate_from_template() {
+        local template="$1"
+        local output="$2"
+        _tmpl_generate_from_template "$template" "$output" || return 1
+        log OK "Generated: $output"
+    }
+
+    # Rendered service files are instance-specific and must never land back
+    # in the tracked repo services/ dir. Render to a runtime workspace dir.
+    local rendered_services_dir="$LOBSTER_WORKSPACE/services"
+    mkdir -p "$rendered_services_dir"
+
+    if $DRY_RUN; then
+        log INFO "Would regenerate service files from templates and reinstall to /etc/systemd/system/"
+        for tmpl in services/*.service.template; do
+            [ -f "$tmpl" ] || continue
+            local svc_name
+            svc_name=$(basename "$tmpl" .template)
+            log INFO "  $tmpl -> /etc/systemd/system/$svc_name"
+        done
+        return 0
     fi
 
-    if $changed; then
-        log INFO "Service files changed, updating..."
+    local updated=false
+    for tmpl in services/*.service.template; do
+        [ -f "$tmpl" ] || continue
+        local svc_name
+        svc_name=$(basename "$tmpl" .template)
+        local generated="$rendered_services_dir/$svc_name"
 
-        if $DRY_RUN; then
-            log INFO "Would copy service files and reload systemd"
-        else
-            for svc_file in services/*.service; do
-                if [ -f "$svc_file" ]; then
-                    local svc_name=$(basename "$svc_file")
-                    sudo cp "$svc_file" "/etc/systemd/system/$svc_name"
-                    log OK "Updated $svc_name"
-                fi
-            done
+        # Generate the service file from the template
+        generate_from_template "$tmpl" "$generated"
 
-            sudo systemctl daemon-reload
-            log OK "Systemd daemon reloaded"
+        # Install to systemd directory
+        sudo cp "$generated" "/etc/systemd/system/$svc_name"
+        log OK "Reinstalled $svc_name"
+        updated=true
+    done
+
+    # Also copy any non-template service files (e.g. lobster.target)
+    for svc_file in services/*.service services/*.target; do
+        [ -f "$svc_file" ] || continue
+        # Skip generated files (they were already handled above)
+        [[ "$svc_file" == *.template ]] && continue
+        # Skip any .service file that has a corresponding .template
+        # (those were already generated and installed by Loop 1 above)
+        [[ -f "${svc_file}.template" ]] && continue
+        local svc_name
+        svc_name=$(basename "$svc_file")
+        # Only copy files that are tracked in git (not the gitignored generated ones)
+        if git ls-files --error-unmatch "$svc_file" 2>/dev/null; then
+            sudo cp "$svc_file" "/etc/systemd/system/$svc_name"
+            log OK "Reinstalled $svc_name"
+            updated=true
         fi
-    else
-        log OK "No service file changes"
+    done
+
+    if $updated; then
+        sudo systemctl daemon-reload
+        log OK "Systemd daemon reloaded"
     fi
 }
 
@@ -475,6 +586,50 @@ update_cli() {
 }
 
 #-------------------------------------------------------------------------------
+# Re-chmod launchers
+#
+# git pull does not preserve execute bits lost via editor saves or other
+# accidents.  Re-applying chmod +x after every pull ensures launchers and
+# hooks remain executable regardless of how they were modified.
+#-------------------------------------------------------------------------------
+
+rechmod_launchers() {
+    log STEP "Re-applying execute bits to launchers"
+
+    cd "$LOBSTER_DIR"
+
+    if $DRY_RUN; then
+        log INFO "Would chmod +x scripts/*.sh scripts/*.exp hooks/* install.sh"
+        return 0
+    fi
+
+    # Shell scripts in scripts/
+    # compgen -G tests whether a glob matches any files (bash builtin, no subprocess)
+    if compgen -G 'scripts/*.sh' > /dev/null 2>&1; then
+        chmod +x scripts/*.sh
+        log OK "chmod +x scripts/*.sh"
+    fi
+
+    # Expect scripts in scripts/
+    if compgen -G 'scripts/*.exp' > /dev/null 2>&1; then
+        chmod +x scripts/*.exp
+        log OK "chmod +x scripts/*.exp"
+    fi
+
+    # Hook entry points in hooks/ (pre-commit, post-commit, etc. — no extension)
+    if compgen -G 'hooks/*' > /dev/null 2>&1; then
+        chmod +x hooks/*
+        log OK "chmod +x hooks/*"
+    fi
+
+    # Top-level installer
+    if [ -f "install.sh" ]; then
+        chmod +x install.sh
+        log OK "chmod +x install.sh"
+    fi
+}
+
+#-------------------------------------------------------------------------------
 # Health checks
 #-------------------------------------------------------------------------------
 
@@ -488,8 +643,11 @@ health_checks() {
         return 0
     fi
 
-    # Check services running
-    for service in "${SERVICES_START[@]}"; do
+    # Check services running (SERVICES_START plus lobster-claude, which
+    # hasn't been touched yet at this point -- it's restarted separately,
+    # last, by restart_self_last() -- so this just confirms it's still
+    # healthy going into that final step)
+    for service in "${SERVICES_START[@]}" "$SERVICE_SELF"; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
             log OK "$service is running"
         else
@@ -497,6 +655,20 @@ health_checks() {
             failed=true
         fi
     done
+
+    # Verify the repo actually landed on the commit git_update() merged to
+    # (issue #2179, suggested-fix option 3: catch a partial/interrupted
+    # update instead of letting it silently look like success).
+    if [ -n "$CURRENT_COMMIT" ]; then
+        local actual_head
+        actual_head=$(cd "$LOBSTER_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        if [ "$actual_head" = "$CURRENT_COMMIT" ]; then
+            log OK "Repository HEAD confirmed at $CURRENT_COMMIT"
+        else
+            log ERROR "Repository HEAD is $actual_head, expected $CURRENT_COMMIT -- update did not fully apply"
+            failed=true
+        fi
+    fi
 
     # Check MCP server registration
     if claude mcp list 2>/dev/null | grep -q "lobster-inbox"; then
@@ -560,6 +732,16 @@ health_checks() {
 #-------------------------------------------------------------------------------
 
 perform_rollback() {
+    # $1: "true" to also bounce lobster-claude (self) as the last step, once
+    # everything else below has finished. Only pass "true" for the explicit
+    # `--rollback` CLI invocation. In-flow failure-recovery call sites (git
+    # merge failed / services failed to start / health checks failed) must
+    # NOT pass this -- lobster-claude was never touched in those cases (it's
+    # only ever stopped/started by restart_self_last(), which hasn't run
+    # yet), so there is nothing to restart and doing so would cause an
+    # unnecessary, unrelated bounce of a perfectly healthy service.
+    local restart_self="${1:-false}"
+
     log STEP "Performing rollback"
 
     # Find most recent backup
@@ -600,6 +782,10 @@ perform_rollback() {
 
     # Start services
     start_services
+
+    if [ "$restart_self" = "true" ]; then
+        restart_self_last
+    fi
 
     log OK "Rollback complete"
 }
@@ -657,6 +843,12 @@ send_notification() {
             -d "parse_mode=HTML" \
             >/dev/null 2>&1 || true
     done
+}
+
+notify_starting() {
+    local msg="<b>🔄 Lobster updating</b>
+Going down for update. Current: <code>$PREVIOUS_COMMIT</code>"
+    send_notification "info" "$msg"
 }
 
 notify_success() {
@@ -727,7 +919,11 @@ main() {
     trap cleanup_lock EXIT
 
     if $ROLLBACK; then
-        perform_rollback
+        # restart_self=true: an explicit --rollback changes the checked-out
+        # commit, so lobster-claude should pick up the restored code, same
+        # as the normal update path -- as the last step, after rollback work
+        # (git checkout, state restore, mcp-local/router restart) is done.
+        perform_rollback true
         cleanup_lock
         exit 0
     fi
@@ -737,6 +933,11 @@ main() {
 
     # Phase 2: Backup
     create_backup
+
+    # Notify before going down
+    if ! $DRY_RUN; then
+        notify_starting
+    fi
 
     # Phase 3: Stop services
     stop_services
@@ -762,6 +963,9 @@ main() {
 
     # Phase 7.5: CLI
     update_cli
+
+    # Phase 7.6: Re-chmod launchers (idempotent; guards against lost execute bits)
+    rechmod_launchers
 
     # Phase 8: Start services
     if ! start_services; then
@@ -804,6 +1008,15 @@ main() {
     fi
 
     cleanup_lock
+
+    # Phase 11 (LAST, on purpose -- issue #2179): bounce lobster-claude only
+    # now that everything above -- git update, deps, systemd regen, CLI
+    # update, mcp-local/router restart, health checks, HEAD verification,
+    # success notification, and lock cleanup -- has already completed. If
+    # this call triggers this very process's own termination (invoked from
+    # inside the live lobster-claude session), the update has already
+    # actually happened by this point.
+    restart_self_last
 }
 
 # Run main with all arguments

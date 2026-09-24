@@ -1,7 +1,7 @@
 """
 MCP Tool handlers for the User Model subsystem.
 
-Provides 7 MCP tools:
+Provides 9 MCP tools:
   model_observe      — record observations from messages
   model_query        — structured query over the model
   model_preferences  — context-resolved preference list
@@ -9,6 +9,8 @@ Provides 7 MCP tools:
   model_correct      — apply user correction
   model_inspect      — deep-read a specific entity
   model_attention    — get scored attention stack
+  model_infer        — context-aware prediction of user state and needs
+  model_user_context — get user profile context for system prompt injection
 
 Tool definitions (for inbox_server.py list_tools) are exported as
 USER_MODEL_TOOLS (list of Tool dicts).
@@ -77,6 +79,10 @@ USER_MODEL_TOOL_DEFINITIONS = [
                     "description": "Confidence in the observation (0.0–1.0). Default: 0.7",
                     "default": 0.7,
                 },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional: chat_id of the user being observed. Stored as user_id for multi-user isolation.",
+                },
             },
             "required": ["message_text", "message_id"],
         },
@@ -105,6 +111,10 @@ USER_MODEL_TOOL_DEFINITIONS = [
                     "description": "Maximum results to return. Default: 20.",
                     "default": 20,
                 },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional: filter results to this user's data only.",
+                },
             },
             "required": ["query_type"],
         },
@@ -131,6 +141,10 @@ USER_MODEL_TOOL_DEFINITIONS = [
                     "description": "Minimum confidence threshold (0.0–1.0). Default: 0.5",
                     "default": 0.5,
                 },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional: filter preferences to this user only.",
+                },
             },
         },
     },
@@ -152,6 +166,10 @@ USER_MODEL_TOOL_DEFINITIONS = [
                     "type": "boolean",
                     "description": "If true, also sync the markdown file layer. Default: true.",
                     "default": True,
+                },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional: user_id scope for reflection.",
                 },
             },
         },
@@ -178,6 +196,10 @@ USER_MODEL_TOOL_DEFINITIONS = [
                     "type": "number",
                     "description": "Optional: new strength value (0.0–1.0).",
                 },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional: user_id scope for the correction.",
+                },
             },
             "required": ["node_id", "corrected_description"],
         },
@@ -200,6 +222,10 @@ USER_MODEL_TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Type of entity: preference (default).",
                     "default": "preference",
+                },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional: user_id scope for inspection.",
                 },
             },
             "required": ["entity_id"],
@@ -226,6 +252,68 @@ USER_MODEL_TOOL_DEFINITIONS = [
                     "description": "Maximum items to return. Default: 10.",
                     "default": 10,
                 },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional: filter attention items to this user only.",
+                },
+            },
+        },
+    },
+    {
+        "name": "model_infer",
+        "description": (
+            "Context-aware prediction of user state and needs. Returns mood estimate "
+            "(VAD), response style hint, likely next request type, and optional value "
+            "alignment score. Results are cached for 30 minutes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "contexts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Active contexts (e.g. ['work', 'coding']). Empty = general.",
+                    "default": [],
+                },
+                "recent_message": {
+                    "type": "string",
+                    "description": "The most recent user message for intent detection.",
+                },
+                "task_description": {
+                    "type": "string",
+                    "description": "Optional task description for value alignment scoring.",
+                },
+                "force_refresh": {
+                    "type": "boolean",
+                    "description": "If true, bypass cache and recompute. Default: false.",
+                    "default": False,
+                },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional: user_id scope for inference.",
+                },
+            },
+        },
+    },
+    {
+        "name": "model_user_context",
+        "description": (
+            "Get the user's profile context for system prompt injection. "
+            "With deep=false (default), returns a compact ~150 token header. "
+            "With deep=true, returns full profile, goals, and preferences."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deep": {
+                    "type": "boolean",
+                    "description": "If true, return full profile data. Default: false.",
+                    "default": False,
+                },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional: user_id scope for context retrieval.",
+                },
             },
         },
     },
@@ -245,6 +333,8 @@ def handle_model_observe(conn: sqlite3.Connection, args: dict, workspace_path: s
     observation_type = args.get("observation_type", "preference")
     confidence = float(args.get("confidence", 0.7))
 
+    user_id = args.get("chat_id", "default")
+
     if not message_text or not message_id:
         return json.dumps({"error": "message_text and message_id are required"})
 
@@ -252,7 +342,7 @@ def handle_model_observe(conn: sqlite3.Connection, args: dict, workspace_path: s
         # Record an explicit observation directly
         from .db import insert_observation
         from .schema import Observation, ObservationSignalType
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         type_map = {
             "preference": ObservationSignalType.PREFERENCE,
@@ -271,9 +361,9 @@ def handle_model_observe(conn: sqlite3.Connection, args: dict, workspace_path: s
             content=explicit_observation,
             confidence=confidence,
             context=context,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
-        obs_id = insert_observation(conn, obs)
+        obs_id = insert_observation(conn, obs, user_id=user_id)
         result = {"success": True, "mode": "explicit", "obs_id": obs_id, "signal_type": observation_type}
     else:
         # Auto-extract signals from message text
@@ -371,6 +461,39 @@ def handle_model_attention(conn: sqlite3.Connection, args: dict) -> str:
     return json.dumps(result, default=str)
 
 
+def handle_model_infer(conn: sqlite3.Connection, args: dict) -> str:
+    """Handle model_infer tool call."""
+    from .infer import run_inference
+
+    contexts = args.get("contexts", [])
+    recent_message = args.get("recent_message")
+    task_description = args.get("task_description")
+    force_refresh = bool(args.get("force_refresh", False))
+
+    result = run_inference(
+        conn,
+        contexts=contexts,
+        recent_message=recent_message,
+        task_description=task_description,
+        force_refresh=force_refresh,
+    )
+    return json.dumps(result, default=str)
+
+
+def handle_model_user_context(conn: sqlite3.Connection, args: dict) -> str:
+    """Handle model_user_context tool call."""
+    from .profile import get_compact_context, read_all_profiles
+
+    deep = bool(args.get("deep", False))
+
+    if deep:
+        profiles = read_all_profiles()
+        return json.dumps(profiles, default=str)
+    else:
+        context = get_compact_context()
+        return json.dumps({"context": context})
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -393,6 +516,8 @@ def dispatch(
         "model_correct": lambda: handle_model_correct(conn, args),
         "model_inspect": lambda: handle_model_inspect(conn, args),
         "model_attention": lambda: handle_model_attention(conn, args),
+        "model_infer": lambda: handle_model_infer(conn, args),
+        "model_user_context": lambda: handle_model_user_context(conn, args),
     }
 
     handler = handlers.get(tool_name)

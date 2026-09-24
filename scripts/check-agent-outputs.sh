@@ -23,6 +23,17 @@
 
 set -euo pipefail
 
+# Developer mode: suppress all system notifications so the developer isn't
+# bothered while testing. Real user messages are never affected by this flag.
+_LOBSTER_CONFIG="${LOBSTER_CONFIG_DIR:-$HOME/lobster-config}/config.env"
+if [ -f "$_LOBSTER_CONFIG" ]; then
+    _DEV_MODE=$(grep -m1 '^LOBSTER_DEV_MODE=' "$_LOBSTER_CONFIG" 2>/dev/null | cut -d= -f2)
+    if [ "$_DEV_MODE" = "true" ] || [ "$_DEV_MODE" = "1" ]; then
+        exit 0
+    fi
+fi
+unset _LOBSTER_CONFIG _DEV_MODE
+
 MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
 INBOX_DIR="$MESSAGES_DIR/inbox"
 CONFIG_DIR="$MESSAGES_DIR/config"
@@ -36,6 +47,10 @@ COMPLETION_THRESHOLD_SECONDS=120
 
 mkdir -p "$STATE_DIR" "$INBOX_DIR"
 touch "$NOTIFIED_FILE" 2>/dev/null || true
+
+# Shared jq --arg JSON builder (BIS-724, scripts/lib/json_message.sh) — single
+# source of truth for jq-arg-safe JSON construction, see PR history for #2004.
+source "${LOBSTER_INSTALL_DIR:-$HOME/lobster}/scripts/lib/json_message.sh"
 
 # Bail early if pending-agents.json doesn't exist or has no agents
 if [ ! -f "$PENDING_AGENTS_FILE" ]; then
@@ -104,18 +119,17 @@ while IFS= read -r agent_id; do
     # Safely escape agent_id for JSON (alphanumeric + hyphens only expected)
     SAFE_ID=$(echo "$agent_id" | tr -cd 'a-zA-Z0-9_-')
 
-    cat > "${INBOX_DIR}/${MSG_ID}.json" << EOF
-{
-  "id": "${MSG_ID}",
-  "source": "system",
-  "chat_id": 0,
-  "user_id": 0,
-  "username": "lobster-system",
-  "user_name": "Agent Relay",
-  "text": "Agent relay check: ${SAFE_ID} output file appears complete. Check task-notifications and relay results to Drew.",
-  "timestamp": "${TIMESTAMP}"
-}
-EOF
+    _json_build_message \
+        --arg id "${MSG_ID}" \
+        --arg source "system" \
+        --arg type "health_check" \
+        --argjson chat_id 0 \
+        --argjson user_id 0 \
+        --arg username "lobster-system" \
+        --arg user_name "Agent Relay" \
+        --arg text "Agent relay check: ${SAFE_ID} output file appears complete. Check task-notifications and relay results to the user." \
+        --arg timestamp "${TIMESTAMP}" \
+        > "${INBOX_DIR}/${MSG_ID}.json"
 
     # Mark this agent as notified to prevent re-injection
     echo "$agent_id" >> "$NOTIFIED_FILE"

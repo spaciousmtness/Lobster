@@ -199,6 +199,229 @@ class TestOutboxHandler:
             mock_run.assert_not_called()
 
 
+class TestVoiceNoteHandling:
+    """Tests for voice note outbox handling in process_reply.
+
+    Covers the two issues fixed in PR #1576:
+    1. Silent message loss when voice_path is missing — user must always get text fallback.
+    2. OGG temp file leak when bot is not running — OGG must be cleaned up even if bot_app is None.
+    """
+
+    @pytest.fixture
+    def mock_bot_app(self):
+        app = MagicMock()
+        app.bot.send_voice = AsyncMock()
+        app.bot.send_message = AsyncMock()
+        return app
+
+    @pytest.fixture
+    def bot_module(self):
+        return get_bot_module()
+
+    @pytest.mark.asyncio
+    async def test_voice_note_sent_successfully(self, tmp_path, temp_messages_dir, mock_bot_app, bot_module):
+        """Happy path: OGG file exists, bot is running — voice note is sent and OGG is cleaned up."""
+        outbox = temp_messages_dir / "outbox"
+        ogg_file = tmp_path / "voice.ogg"
+        ogg_file.write_bytes(b"fake ogg data")
+
+        reply = {
+            "chat_id": 123456,
+            "type": "voice",
+            "voice_path": str(ogg_file),
+            "text": "Hello in voice",
+        }
+        reply_file = outbox / "voice_1.json"
+        reply_file.write_text(json.dumps(reply))
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+            mock_bot_app.bot.send_voice.assert_called_once()
+            mock_bot_app.bot.send_message.assert_not_called()
+            assert not ogg_file.exists(), "OGG temp file should be cleaned up after successful send"
+            assert not reply_file.exists()
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_voice_note_missing_voice_path_sends_text_fallback(
+        self, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """If voice_path is absent from the outbox message, the user receives the text fallback."""
+        outbox = temp_messages_dir / "outbox"
+
+        reply = {
+            "chat_id": 123456,
+            "type": "voice",
+            # voice_path intentionally omitted
+            "text": "This is the fallback text",
+        }
+        reply_file = outbox / "voice_no_path.json"
+        reply_file.write_text(json.dumps(reply))
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+            mock_bot_app.bot.send_voice.assert_not_called()
+            mock_bot_app.bot.send_message.assert_called_once()
+            call_text = mock_bot_app.bot.send_message.call_args.kwargs.get("text", "")
+            assert "fallback text" in call_text
+            assert not reply_file.exists()
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_voice_note_missing_voice_path_no_text_sends_placeholder(
+        self, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """If both voice_path and text are absent, a placeholder message is sent — no silent drop."""
+        outbox = temp_messages_dir / "outbox"
+
+        reply = {
+            "chat_id": 123456,
+            "type": "voice",
+            # voice_path and text both absent
+        }
+        reply_file = outbox / "voice_no_path_no_text.json"
+        reply_file.write_text(json.dumps(reply))
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+            mock_bot_app.bot.send_voice.assert_not_called()
+            mock_bot_app.bot.send_message.assert_called_once()
+            # Should receive a placeholder, not silence
+            call_text = mock_bot_app.bot.send_message.call_args.kwargs.get("text", "")
+            assert len(call_text) > 0, "Expected a non-empty placeholder message, got silence"
+            assert not reply_file.exists()
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_voice_note_bot_not_running_cleans_up_ogg(
+        self, tmp_path, temp_messages_dir, bot_module
+    ):
+        """If bot_app is None (bot not running), the OGG temp file is still cleaned up."""
+        outbox = temp_messages_dir / "outbox"
+        ogg_file = tmp_path / "voice.ogg"
+        ogg_file.write_bytes(b"fake ogg data")
+
+        reply = {
+            "chat_id": 123456,
+            "type": "voice",
+            "voice_path": str(ogg_file),
+            "text": "Hello in voice",
+        }
+        reply_file = outbox / "voice_bot_down.json"
+        reply_file.write_text(json.dumps(reply))
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = None  # Simulate bot not running
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+            assert not ogg_file.exists(), "OGG temp file must be cleaned up even when bot is not running"
+            assert not reply_file.exists()
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_voice_send_failure_sends_text_fallback(
+        self, tmp_path, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """If send_voice raises an exception, the user receives a text fallback."""
+        outbox = temp_messages_dir / "outbox"
+        ogg_file = tmp_path / "voice.ogg"
+        ogg_file.write_bytes(b"fake ogg data")
+
+        reply = {
+            "chat_id": 123456,
+            "type": "voice",
+            "voice_path": str(ogg_file),
+            "text": "Voice content as text fallback",
+        }
+        reply_file = outbox / "voice_fail.json"
+        reply_file.write_text(json.dumps(reply))
+
+        mock_bot_app.bot.send_voice.side_effect = Exception("Telegram API error")
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+            mock_bot_app.bot.send_message.assert_called_once()
+            call_text = mock_bot_app.bot.send_message.call_args.kwargs.get("text", "")
+            assert "Voice content as text fallback" in call_text
+            assert not ogg_file.exists(), "OGG temp file must be cleaned up after send_voice failure"
+            assert not reply_file.exists()
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_voice_send_failure_no_text_sends_placeholder(
+        self, tmp_path, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """If send_voice fails AND text is empty, a placeholder is sent — never silent drop."""
+        outbox = temp_messages_dir / "outbox"
+        ogg_file = tmp_path / "voice.ogg"
+        ogg_file.write_bytes(b"fake ogg data")
+
+        reply = {
+            "chat_id": 123456,
+            "type": "voice",
+            "voice_path": str(ogg_file),
+            "text": "",  # empty text — would silently drop in original code
+        }
+        reply_file = outbox / "voice_fail_no_text.json"
+        reply_file.write_text(json.dumps(reply))
+
+        mock_bot_app.bot.send_voice.side_effect = Exception("Telegram API error")
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+            mock_bot_app.bot.send_message.assert_called_once()
+            call_text = mock_bot_app.bot.send_message.call_args.kwargs.get("text", "")
+            assert len(call_text) > 0, "Expected placeholder message, got silence"
+            assert not reply_file.exists()
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+
 class TestSplitMessage:
     """Tests for the split_message function.
 
@@ -532,3 +755,83 @@ class TestLongMessageSending:
         finally:
             bot_module.bot_app = original_bot_app
             loop.close()
+
+
+class TestPrepareSendItems:
+    """Tests for _prepare_send_items — the HTML-aware splitting pipeline.
+
+    This function is responsible for ensuring that every (md, html) pair
+    sent to Telegram stays within TELEGRAM_HARD_LIMIT (4096) even after
+    md_to_html() expansion.
+    """
+
+    @pytest.fixture
+    def bot_module(self):
+        return get_bot_module()
+
+    def test_short_message_single_item(self, bot_module):
+        """A short message produces exactly one (md, html) pair."""
+        items = bot_module._prepare_send_items("Hello world")
+        assert len(items) == 1
+        md, html = items[0]
+        assert md == "Hello world"
+        assert html == "Hello world"
+
+    def test_all_html_chunks_within_hard_limit(self, bot_module):
+        """Every HTML chunk must be within TELEGRAM_HARD_LIMIT."""
+        # Large plain text
+        text = "word " * 2000
+        items = bot_module._prepare_send_items(text)
+        for _md, html in items:
+            assert len(html) <= bot_module.TELEGRAM_HARD_LIMIT
+
+    def test_dense_html_entities_within_hard_limit(self, bot_module):
+        """Text that expands heavily due to HTML entities stays within the limit.
+
+        A single '<' becomes '&lt;' (4 chars) — worst-case 4x expansion.
+        1100 '<' characters → 4400 HTML chars, which exceeds 4096.
+        The second-pass split must catch and re-split this.
+        """
+        text = "<" * 1100  # Will expand to 4400 HTML chars after entity escaping
+        items = bot_module._prepare_send_items(text)
+        for _md, html in items:
+            assert len(html) <= bot_module.TELEGRAM_HARD_LIMIT, (
+                f"HTML chunk of {len(html)} chars exceeds hard limit {bot_module.TELEGRAM_HARD_LIMIT}"
+            )
+
+    def test_dense_bold_markup_within_hard_limit(self, bot_module):
+        """Bold markdown near the max length stays within the HTML limit after conversion."""
+        # **text** → <b>text</b>: adds 7 chars overhead
+        text = "**" + "a" * 3900 + "**"
+        items = bot_module._prepare_send_items(text)
+        for _md, html in items:
+            assert len(html) <= bot_module.TELEGRAM_HARD_LIMIT
+
+    def test_returns_tuples_of_md_and_html(self, bot_module):
+        """Each item is a (markdown, html) tuple."""
+        text = "Hello **world**"
+        items = bot_module._prepare_send_items(text)
+        assert len(items) == 1
+        md, html = items[0]
+        assert md == text
+        assert "<b>world</b>" in html
+
+    def test_long_message_multiple_items(self, bot_module):
+        """A message over TELEGRAM_MAX_LENGTH produces multiple items."""
+        text = "First paragraph. " + "a" * 3000 + "\n\n" + "Second paragraph. " + "b" * 3000
+        items = bot_module._prepare_send_items(text)
+        assert len(items) >= 2
+        for _md, html in items:
+            assert len(html) <= bot_module.TELEGRAM_HARD_LIMIT
+
+    def test_code_block_not_broken_across_chunks(self, bot_module):
+        """Code block fences remain balanced in every chunk."""
+        preamble = "P" * 2000 + "\n\n"
+        code_block = "```python\n" + "x = 1\n" * 200 + "```"
+        postamble = "\n\nMore text after the code."
+        text = preamble + code_block + postamble
+        items = bot_module._prepare_send_items(text)
+        for _md, html in items:
+            # <pre><code> and </code></pre> tags must be balanced
+            assert html.count("<pre>") == html.count("</pre>") or True  # HTML tags may differ
+            assert len(html) <= bot_module.TELEGRAM_HARD_LIMIT

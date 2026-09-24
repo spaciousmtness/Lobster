@@ -78,24 +78,33 @@ reset_tasks() {
     rm -f "$TEST_TASKS_DIR"/*
 }
 
-# Create a fake agent output file with N assistant turns
+# Create a fake agent output file with N assistant turns.
+# Real subagent output files are symlinks; this function creates a real JSONL
+# file and then a symlink pointing to it, matching the Claude Code convention.
 # Args: $1=filename, $2=num_assistant_turns, $3=mtime_seconds_ago (optional, default 0)
 create_agent_file() {
     local filename="$1"
     local turns="$2"
     local age_seconds="${3:-0}"
-    local filepath="$TEST_TASKS_DIR/$filename"
+    local real_filepath="$TEST_TMPDIR/real_${filename}"
+    local symlink_path="$TEST_TASKS_DIR/$filename"
 
-    > "$filepath"
+    > "$real_filepath"
     for ((i = 1; i <= turns; i++)); do
-        echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"turn '"$i"'"}]}}' >> "$filepath"
+        echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"turn '"$i"'"}]}}' >> "$real_filepath"
         # Add some non-assistant lines too (tool use, user, progress)
-        echo '{"type":"user","message":{"role":"user","content":[{"type":"tool_result"}]}}' >> "$filepath"
-        echo '{"type":"progress","data":{"type":"hook_progress"}}' >> "$filepath"
+        echo '{"type":"user","message":{"role":"user","content":[{"type":"tool_result"}]}}' >> "$real_filepath"
+        echo '{"type":"progress","data":{"type":"hook_progress"}}' >> "$real_filepath"
     done
 
     if [ "$age_seconds" -gt 0 ]; then
-        touch -d "$age_seconds seconds ago" "$filepath"
+        touch -d "$age_seconds seconds ago" "$real_filepath"
+    fi
+
+    # Create a symlink (matching how Claude Code writes real subagent output files)
+    ln -sf "$real_filepath" "$symlink_path"
+    if [ "$age_seconds" -gt 0 ]; then
+        touch -h -d "$age_seconds seconds ago" "$symlink_path" 2>/dev/null || true
     fi
 }
 
@@ -179,11 +188,11 @@ else
     fail "Expected 'stale 2h' in: '$RESULT'"
 fi
 
-# Test 7: Multiple agents
+# Test 7: Multiple agents (both within the 10-minute stale threshold)
 begin_test "Reports multiple agents separated by comma"
 reset_tasks
 create_agent_file "agent_a.output" 10 5
-create_agent_file "agent_b.output" 20 900
+create_agent_file "agent_b.output" 20 30
 source_agent_status
 RESULT=$(scan_agent_status)
 if [[ "$RESULT" == *"agent_a"* ]] && [[ "$RESULT" == *"agent_b"* ]]; then
@@ -206,35 +215,37 @@ else
     fail "Expected '5 turns' in: '$RESULT'"
 fi
 
-# Test 9: Stale threshold is 15 minutes (900 seconds)
-begin_test "Agent at exactly 14 minutes is NOT stale"
+# Test 9: Stale threshold is 60 minutes (3600 seconds) for empty stop_reason
+begin_test "Agent at exactly 59 minutes is NOT stale"
 reset_tasks
-create_agent_file "border.output" 10 840
+create_agent_file "border.output" 10 3540
 source_agent_status
 RESULT=$(scan_agent_status)
-if [[ "$RESULT" == *"last activity"* ]] && [[ "$RESULT" != *"stale"* ]]; then
+if [[ "$RESULT" == *"border"* ]] && [[ "$RESULT" != *"stale"* ]]; then
     pass
 else
-    fail "Expected 'last activity' (not stale) in: '$RESULT'"
+    fail "Expected agent to appear (not stale) in: '$RESULT'"
 fi
 
-# Test 10: Agent at 16 minutes IS stale
-begin_test "Agent at 16 minutes IS stale"
+# Test 10: Agent at 61 minutes IS filtered as stale (STALE_STARTING_SECONDS=3600)
+begin_test "Agent at 61 minutes IS stale"
 reset_tasks
-create_agent_file "border2.output" 10 960
+create_agent_file "border2.output" 10 3660
 source_agent_status
 RESULT=$(scan_agent_status)
-if [[ "$RESULT" == *"stale"* ]]; then
+if [ -z "$RESULT" ]; then
     pass
 else
-    fail "Expected 'stale' in: '$RESULT'"
+    fail "Expected empty (stale agent filtered), got: '$RESULT'"
 fi
 
 # Test 11: Zero-turn file (empty or no assistant lines)
 begin_test "File with zero assistant turns shows 0 turns"
 reset_tasks
-echo '{"type":"user","message":{}}' > "$TEST_TASKS_DIR/empty_agent.output"
-touch -d "10 seconds ago" "$TEST_TASKS_DIR/empty_agent.output"
+TEST11_REAL="$TEST_TMPDIR/real_empty_agent.output"
+echo '{"type":"user","message":{}}' > "$TEST11_REAL"
+touch -d "10 seconds ago" "$TEST11_REAL"
+ln -sf "$TEST11_REAL" "$TEST_TASKS_DIR/empty_agent.output"
 source_agent_status
 RESULT=$(scan_agent_status)
 if [[ "$RESULT" == *"0 turns"* ]]; then
@@ -333,6 +344,83 @@ if [[ "$RESULT" =~ ^Agents:\ .+\([0-9]+\ turns,\ (last\ activity|stale)\ [0-9]+[
     pass
 else
     fail "Format mismatch: '$RESULT'"
+fi
+
+# Test 19: _get_stop_reason handles unquoted JSON null as the true last line
+# Regression test for issue #56: a turn that ends by calling a tool (e.g.
+# write_result) is written as the JSON literal "stop_reason":null (unquoted).
+# The old regex only matched quoted string values, so this line was skipped
+# and a stale earlier quoted match (e.g. "tool_use") was returned instead,
+# causing completed agents to be reported as perpetually running.
+begin_test "_get_stop_reason returns empty (not stale tool_use) when true last line is unquoted null"
+reset_tasks
+NULL_REAL="$TEST_TMPDIR/real_null_last.output"
+cat > "$NULL_REAL" <<'EOF'
+{"type":"assistant","stop_reason":"tool_use"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result"}]}}
+{"type":"assistant","stop_reason":null}
+EOF
+source_agent_status
+RESULT=$(_get_stop_reason "$NULL_REAL")
+if [ -z "$RESULT" ]; then
+    pass
+else
+    fail "Expected empty string (null == not terminal), got: '$RESULT'"
+fi
+
+# Test 20: _get_stop_reason still finds tool_use when null comes before it
+begin_test "_get_stop_reason returns tool_use when it is chronologically last (after a null)"
+reset_tasks
+TOOLUSE_REAL="$TEST_TMPDIR/real_tooluse_last.output"
+cat > "$TOOLUSE_REAL" <<'EOF'
+{"type":"assistant","stop_reason":null}
+{"type":"assistant","stop_reason":"tool_use"}
+EOF
+source_agent_status
+RESULT=$(_get_stop_reason "$TOOLUSE_REAL")
+if [ "$RESULT" = "tool_use" ]; then
+    pass
+else
+    fail "Expected 'tool_use', got: '$RESULT'"
+fi
+
+# Test 21: _get_stop_reason still detects end_turn correctly (no regression)
+begin_test "_get_stop_reason returns end_turn when it is the last quoted value"
+reset_tasks
+ENDTURN_REAL="$TEST_TMPDIR/real_endturn_last.output"
+cat > "$ENDTURN_REAL" <<'EOF'
+{"type":"assistant","stop_reason":"tool_use"}
+{"type":"assistant","stop_reason":"end_turn"}
+EOF
+source_agent_status
+RESULT=$(_get_stop_reason "$ENDTURN_REAL")
+if [ "$RESULT" = "end_turn" ]; then
+    pass
+else
+    fail "Expected 'end_turn', got: '$RESULT'"
+fi
+
+# Test 22: An agent whose final turn ends in unquoted null (e.g. finished via
+# write_result) is not misreported using a stale earlier "tool_use" match.
+# It should be treated by age (starting/stale), not silently locked at
+# whatever the earlier quoted value was.
+begin_test "scan_agent_status does not use stale tool_use when true last stop_reason is null"
+reset_tasks
+NULL_SYMLINK_REAL="$TEST_TMPDIR/real_nulltask.output"
+cat > "$NULL_SYMLINK_REAL" <<'EOF'
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"turn 1"}]},"stop_reason":"tool_use"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"turn 2"}]},"stop_reason":null}
+EOF
+touch -d "5 seconds ago" "$NULL_SYMLINK_REAL"
+ln -sf "$NULL_SYMLINK_REAL" "$TEST_TASKS_DIR/nulltask.output"
+touch -h -d "5 seconds ago" "$TEST_TASKS_DIR/nulltask.output" 2>/dev/null || true
+source_agent_status
+RESULT=$(scan_agent_status)
+if [[ "$RESULT" == *"nulltask"* ]]; then
+    pass
+else
+    fail "Expected 'nulltask' present (treated as starting/running by age, not skipped): '$RESULT'"
 fi
 
 #===============================================================================

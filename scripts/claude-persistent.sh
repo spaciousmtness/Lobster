@@ -27,12 +27,32 @@
 set -uo pipefail
 # Note: not using set -e because we handle exit codes explicitly
 
+# =============================================================================
+# CRITICAL: Sanitize Claude Code environment variables IMMEDIATELY at script
+# entry, before anything else runs. Claude Code sets CLAUDECODE=1 and
+# CLAUDE_CODE_ENTRYPOINT in its own process. These leak when:
+#   1. An SSH user runs Claude Code, which sets these in the shell
+#   2. That shell (or systemd) launches tmux, which inherits the vars
+#   3. The tmux server passes them to all new panes/windows
+#   4. claude binary inside tmux sees CLAUDECODE=1 and refuses to start
+#
+# This MUST happen at script top level (not inside a function) so the vars
+# are stripped from this process's environment before tmux inherits them.
+# The launch_claude() function also strips them from tmux's global env as
+# a second layer of defense.
+# =============================================================================
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
+
 WORKSPACE_DIR="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
 INSTALL_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
 MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
 STATE_FILE="$MESSAGES_DIR/config/lobster-state.json"
 LOG_DIR="$WORKSPACE_DIR/logs"
 LOG_FILE="$LOG_DIR/claude-persistent.log"
+
+# Auth failure tracking
+AUTH_FAIL_COUNT=0
+AUTH_FAIL_ALERTED=false
 
 # Ensure directories exist
 mkdir -p "$MESSAGES_DIR/config" "$LOG_DIR"
@@ -74,6 +94,28 @@ log() {
 }
 
 #===============================================================================
+# Telegram Alerting (direct curl, bypasses outbox)
+#===============================================================================
+send_telegram_alert() {
+    local message="$1"
+    local config_file="${LOBSTER_CONFIG_DIR:-$HOME/lobster-config}/config.env"
+    local bot_token="" chat_id=""
+
+    if [[ -f "$config_file" ]]; then
+        bot_token=$(grep '^TELEGRAM_BOT_TOKEN=' "$config_file" | cut -d'=' -f2-)
+        chat_id=$(grep '^TELEGRAM_ALLOWED_USERS=' "$config_file" | cut -d'=' -f2- | cut -d',' -f1)
+    fi
+
+    [[ -z "$bot_token" || -z "$chat_id" ]] && return
+
+    curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" \
+        --data-urlencode "parse_mode=Markdown" \
+        --max-time 10 >/dev/null 2>&1 || true
+}
+
+#===============================================================================
 # State Management
 #===============================================================================
 write_state() {
@@ -89,6 +131,43 @@ write_state() {
   "pid": $$
 }
 EOF
+}
+
+# Write a booted_at timestamp into the state file without clobbering other fields.
+# Called once at startup so the health-check can suppress false-positive alerts
+# during the ~60-90s it takes a fresh session to initialize.
+write_boot_stamp() {
+    local now
+    now=$(date -Iseconds)
+    # If state file already exists, merge booted_at in without losing other fields.
+    # Fall back to writing a minimal JSON if the file is absent or unreadable.
+    if [[ -f "$STATE_FILE" ]]; then
+        python3 -c "
+import json, sys
+path = '$STATE_FILE'
+now = '$now'
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d['booted_at'] = now
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+    f.write('\n')
+" 2>/dev/null || true
+    else
+        cat > "$STATE_FILE" << EOF
+{
+  "mode": "starting",
+  "detail": "boot",
+  "updated_at": "$now",
+  "booted_at": "$now",
+  "pid": $$
+}
+EOF
+    fi
+    log "Boot stamp written (booted_at=$now)"
 }
 
 read_state_mode() {
@@ -151,6 +230,236 @@ except Exception:
 }
 
 #===============================================================================
+# Orphan Process Cleanup
+#
+# Kill stale `claude --dangerously-skip-permissions` processes that are NOT
+# descendants of the current tmux session's pane PIDs.
+#
+# Why this is needed:
+#   When the systemd ExecStop fails (e.g. tmux server already dead), the
+#   `claude` and `bash` child processes from the previous session can linger
+#   as orphans. On the next start these consume resources and can prevent a
+#   clean new session from launching.
+#
+# Safety contract:
+#   - Only kills processes matching "claude.*--dangerously-skip-permissions"
+#   - Walks up to 8 ancestor levels to check lineage
+#   - Any process whose ancestor chain reaches a current tmux pane PID is
+#     considered "ours" and is left alone
+#   - Processes adopted by PID 1 (init) are always considered orphans
+#   - SIGTERM first, SIGKILL only after a 3-second grace period
+#   - SIGKILL is only sent to PIDs that previously received SIGTERM (not the
+#     full original list), preventing accidental kills due to PID reuse
+#===============================================================================
+kill_orphaned_claude_processes() {
+    # Use -a to list panes across ALL sessions and windows, not just the
+    # default window. Without -a, Claude running in a non-default tmux window
+    # would not appear in the pane list and would be misclassified as an orphan.
+    local tmux_panes
+    tmux_panes=$(tmux -L lobster list-panes -a -F '#{pane_pid}' 2>/dev/null || true)
+
+    # If tmux session doesn't exist yet, any found claude process is an orphan
+    local claude_pids
+    claude_pids=$(pgrep -f "claude.*--dangerously-skip-permissions" 2>/dev/null || true)
+
+    if [[ -z "$claude_pids" ]]; then
+        log "CLEANUP: No stale Claude processes found"
+        return 0
+    fi
+
+    log "CLEANUP: Found Claude PID(s): $(echo "$claude_pids" | tr '\n' ' ')"
+
+    local killed=0
+    local skipped=0
+    # Track only the PIDs that received SIGTERM so the SIGKILL pass doesn't
+    # accidentally target unrelated processes that the OS assigned the same
+    # PID during the 3-second grace window.
+    local sigterm_pids=()
+
+    for pid in $claude_pids; do
+        # Skip if process no longer exists
+        if ! kill -0 "$pid" 2>/dev/null; then
+            continue
+        fi
+
+        # Check if this pid is a descendant of any current tmux pane
+        local is_ours=false
+        if [[ -n "$tmux_panes" ]]; then
+            local check_pid="$pid"
+            for _hop in 1 2 3 4 5 6 7 8; do
+                local ppid
+                ppid=$(ps -o ppid= -p "$check_pid" 2>/dev/null | tr -d ' ')
+                if [[ -z "$ppid" || "$ppid" == "1" ]]; then
+                    # Reached init — orphan
+                    break
+                fi
+                if echo "$tmux_panes" | grep -qw "$ppid"; then
+                    is_ours=true
+                    break
+                fi
+                check_pid="$ppid"
+            done
+        fi
+
+        if [[ "$is_ours" == "true" ]]; then
+            log "CLEANUP: PID $pid is a current-session descendant — skipping"
+            skipped=$((skipped + 1))
+        else
+            log "CLEANUP: Killing orphaned Claude PID $pid (SIGTERM)"
+            if kill -TERM "$pid" 2>/dev/null; then
+                sigterm_pids+=("$pid")
+            fi
+            killed=$((killed + 1))
+        fi
+    done
+
+    # Give processes a brief grace period to exit cleanly
+    if [[ $killed -gt 0 ]]; then
+        sleep 3
+        # SIGKILL only the PIDs we sent SIGTERM to — not the full original list.
+        # This avoids killing unrelated processes that may have been assigned
+        # one of the recycled PIDs during the 3-second grace window.
+        for pid in "${sigterm_pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                log "CLEANUP: PID $pid still alive after SIGTERM — sending SIGKILL"
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        done
+        log "CLEANUP: Sent SIGTERM to $killed orphaned Claude process(es), skipped $skipped in-session"
+    else
+        log "CLEANUP: No orphaned Claude processes to kill (skipped $skipped in-session)"
+    fi
+}
+
+#===============================================================================
+# Kill orphaned MCP server processes (inbox_server.py, obsidian-mcp, etc.)
+# that are NOT descendants of the current tmux session's pane PIDs.
+#
+# Why this is needed:
+#   When Claude is killed or exits abnormally, the MCP servers it launched
+#   (inbox_server.py, obsidian-mcp via npx, etc.) become orphaned — their
+#   parent Claude process is gone but they continue running. On the next
+#   restart, Claude spawns fresh MCP servers. Without cleanup the old ones
+#   accumulate indefinitely, leaking memory and file descriptors.
+#
+# Safety contract:
+#   - Only kills processes matching the specific MCP server patterns below
+#   - Uses the same tmux pane lineage check as kill_orphaned_claude_processes
+#   - SIGTERM first, SIGKILL only after a 3-second grace period
+#   - SIGKILL only sent to PIDs that received SIGTERM (prevents PID-reuse kills)
+#===============================================================================
+kill_orphaned_mcp_processes() {
+    local tmux_panes
+    tmux_panes=$(tmux -L lobster list-panes -a -F '#{pane_pid}' 2>/dev/null || true)
+
+    # Collect PIDs for each known MCP server pattern
+    local mcp_pids=""
+    mcp_pids+=" $(pgrep -f "src/mcp/inbox_server\.py" 2>/dev/null || true)"
+    mcp_pids+=" $(pgrep -f "obsidian-mcp" 2>/dev/null || true)"
+    mcp_pids=$(echo "$mcp_pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u || true)
+
+    if [[ -z "$mcp_pids" ]]; then
+        log "CLEANUP: No stale MCP server processes found"
+        return 0
+    fi
+
+    log "CLEANUP: Found MCP PID(s): $(echo "$mcp_pids" | tr '\n' ' ')"
+
+    local killed=0
+    local skipped=0
+    local sigterm_pids=()
+
+    for pid in $mcp_pids; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            continue
+        fi
+
+        # Skip systemd-managed services — they are independently lifecycle-managed,
+        # not orphans. Killing them causes a restart race where Claude initializes
+        # before the MCP server comes back up, leaving the session without MCP tools.
+        #
+        # NOTE: `systemctl status` has no `--pid` option. `systemctl status --pid
+        # "$pid"` always fails with "Unknown option '--pid'." (exit 1), which
+        # silently defeated this guard for every PID since it was added in #1551:
+        # the "systemd-managed" branch never triggered, so lobster-mcp-local.service
+        # was always treated as an orphan and SIGTERM'd here on every dispatcher
+        # restart (including the routine ~2h proactive session-age restart from
+        # #2060). RestartSec=0 masked the user-visible impact of the restart
+        # itself, but the service bounce still wiped in-memory session/lock state,
+        # producing spurious session-lost-reminder / dispatcher-marked-dead
+        # notifications with no actual dispatcher crash. See investigation for
+        # issues #2124 / #2142.
+        #
+        # #1551's fix ("pass the PID as a bare positional argument") replaced one
+        # bug with a subtler one (issue #2119): `systemctl status <pid>` does not
+        # ask "is this PID itself a systemd service" — it resolves the PID's
+        # cgroup to whichever unit owns that cgroup and reports THAT unit's
+        # status, exit 0, for *any* PID living anywhere inside it. Every process
+        # under lobster-claude.service's tmux session (the dispatcher, every MCP
+        # child it spawns, and any orphan reparented to PID 1 that still carries
+        # the same cgroup membership from when it was forked) resolves to
+        # lobster-claude.service and returns exit 0 — so this check has always
+        # treated every single MCP child, including hung/orphaned obsidian-mcp
+        # processes, as "systemd-managed" and skipped it. Confirmed empirically
+        # against live orphaned obsidian-mcp PIDs (PPID=1, one per session-age
+        # restart, accumulating indefinitely — see issue #2119).
+        #
+        # Fix: only the process that is actually the recorded MainPID of the
+        # protected unit should be skipped. Compare against MainPID directly
+        # instead of asking "does this PID's cgroup resolve to some unit".
+        local protected_service="${LOBSTER_MCP_SERVICE_NAME:-lobster-mcp.service}"
+        local protected_main_pid
+        protected_main_pid=$(systemctl show -p MainPID --value "$protected_service" 2>/dev/null || true)
+        if [[ -n "$protected_main_pid" && "$protected_main_pid" != "0" && "$pid" == "$protected_main_pid" ]]; then
+            log "CLEANUP: MCP PID $pid is the systemd-managed ${protected_service} MainPID — skipping"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        local is_ours=false
+        if [[ -n "$tmux_panes" ]]; then
+            local check_pid="$pid"
+            for _hop in 1 2 3 4 5 6 7 8; do
+                local ppid
+                ppid=$(ps -o ppid= -p "$check_pid" 2>/dev/null | tr -d ' ')
+                if [[ -z "$ppid" || "$ppid" == "1" ]]; then
+                    break
+                fi
+                if echo "$tmux_panes" | grep -qw "$ppid"; then
+                    is_ours=true
+                    break
+                fi
+                check_pid="$ppid"
+            done
+        fi
+
+        if [[ "$is_ours" == "true" ]]; then
+            log "CLEANUP: MCP PID $pid is a current-session descendant — skipping"
+            skipped=$((skipped + 1))
+        else
+            log "CLEANUP: Killing orphaned MCP PID $pid (SIGTERM)"
+            if kill -TERM "$pid" 2>/dev/null; then
+                sigterm_pids+=("$pid")
+            fi
+            killed=$((killed + 1))
+        fi
+    done
+
+    if [[ $killed -gt 0 ]]; then
+        sleep 3
+        for pid in "${sigterm_pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                log "CLEANUP: MCP PID $pid still alive after SIGTERM — sending SIGKILL"
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        done
+        log "CLEANUP: Sent SIGTERM to $killed orphaned MCP process(es), skipped $skipped in-session"
+    else
+        log "CLEANUP: No orphaned MCP processes to kill (skipped $skipped in-session)"
+    fi
+}
+
+#===============================================================================
 # Launch Claude in persistent mode
 #===============================================================================
 launch_claude() {
@@ -160,6 +469,18 @@ launch_claude() {
     log "STARTING: Launching Claude (attempt $attempt)"
 
     cd "$WORKSPACE_DIR"
+
+    # -------------------------------------------------------------------------
+    # Kill orphaned claude processes from prior sessions before launching a new one.
+    # This prevents resource leaks when ExecStop fails (e.g. tmux already dead).
+    # -------------------------------------------------------------------------
+    kill_orphaned_claude_processes
+
+    # -------------------------------------------------------------------------
+    # Kill orphaned MCP server processes (inbox_server.py, obsidian-mcp, etc.)
+    # that were spawned by killed Claude sessions and never cleaned up.
+    # -------------------------------------------------------------------------
+    kill_orphaned_mcp_processes
 
     # -------------------------------------------------------------------------
     # Clean leaked Claude Code env vars before launching.
@@ -183,7 +504,7 @@ launch_claude() {
     fi
 
     # Build the initial prompt for Claude
-    local init_prompt="Read CLAUDE.md and begin your main loop. Call wait_for_messages(hibernate_on_timeout=true) to start listening for Telegram messages. Process each message as it arrives, then return to wait_for_messages(). Never exit unless hibernating."
+    local init_prompt="Read CLAUDE.md and begin your main loop. Call wait_for_messages() to start listening for Telegram messages. Process each message as it arrives, then return to wait_for_messages(). Never exit."
 
     # Always start fresh. Never use --continue.
     #
@@ -193,12 +514,103 @@ launch_claude() {
     # by design — it reads CLAUDE.md, enters the loop, and processes messages.
     # Any persistent state lives in canonical memory files, not conversation history.
     local claude_exit_code=0
+
+    # Wait for the MCP server to be ready before launching Claude.
+    # kill_orphaned_mcp_processes() may have just SIGTERM'd the old MCP server
+    # (managed by systemd). Systemd restarts it within ~2 seconds, but if Claude
+    # initializes MCP connections before the server is back up, the tools fail to
+    # load and the dispatcher runs without lobster-inbox tools for the entire session.
+    local mcp_port="${LOBSTER_MCP_PORT:-8766}"
+    local mcp_ready=false
+    for i in {1..15}; do
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 \
+            "http://localhost:${mcp_port}/mcp" 2>/dev/null || echo "000")
+        if [[ "$http_code" != "000" ]]; then
+            mcp_ready=true
+            break
+        fi
+        sleep 1
+    done
+    if [[ "$mcp_ready" == "true" ]]; then
+        log "MCP server ready on port ${mcp_port} (HTTP reachable)"
+        # Second-phase check: verify the MCP SSE endpoint accepts proper protocol
+        # connections. The first check may have passed on the dying old server's last
+        # response. Claude's MCP client needs the new server's SSE endpoint to be
+        # fully initialised before launch or the tools are permanently unavailable.
+        local mcp_sse_ready=false
+        for i in {1..10}; do
+            local sse_code
+            sse_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+                -H "Accept: application/json, text/event-stream" \
+                -H "Content-Type: application/json" \
+                -X POST \
+                --data '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"readiness-check","version":"1.0"}}}' \
+                "http://localhost:${mcp_port}/mcp" 2>/dev/null || echo "000")
+            if [[ "$sse_code" == "200" ]]; then
+                mcp_sse_ready=true
+                log "MCP SSE endpoint confirmed ready (attempt $i)"
+                break
+            fi
+            sleep 1
+        done
+        if [[ "$mcp_sse_ready" != "true" ]]; then
+            log "WARNING: MCP SSE endpoint not ready after 10s — launching Claude anyway"
+        fi
+    else
+        log "WARNING: MCP server not responding after 15s — launching Claude anyway"
+    fi
+
     log "Starting fresh session (attempt $attempt)..."
-    claude --dangerously-skip-permissions \
-        --model sonnet \
-        --max-turns 150 \
-        -p "$init_prompt" \
-        2>&1 | tee -a "$LOG_DIR/claude-session.log" || claude_exit_code=$?
+
+    # Schedule a delayed "active" write ~5 seconds after launch so the health
+    # check sees a live signal once the MCP server has had time to initialise.
+    # This runs in the background so it does not block the claude process launch.
+    # The MCP server's _reset_state_on_startup() and handle_wait_for_messages()
+    # will also write "active" once Claude is truly running, but this belt-and-
+    # suspenders write ensures the state transitions even if those paths are slow.
+    #
+    # Fix B (2026-04-03): Guard against the hibernation→active state race.
+    # If Claude exits into hibernation before the 5-second sleep completes,
+    # the background write would overwrite "hibernate" with "active", causing
+    # the health check to see mode=active + no WFM heartbeat → false restart.
+    # Only write "active" if the current mode is NOT "hibernate".
+    ( sleep 5 && current_mode=$(read_state_mode 2>/dev/null || echo "unknown"); [[ "$current_mode" != "hibernate" ]] && write_state "active" "claude running, attempt=$attempt" ) &
+
+    # Write the dispatcher PID file so the health check can target this specific
+    # process for cleanup without relying on ambiguous pgrep matches.
+    #
+    # We use a subshell that writes $BASHPID (the actual subshell PID) and then
+    # exec-replaces itself with claude. After exec, the running claude process
+    # has the same PID that was written to the file. $$ would give the *parent*
+    # shell's PID in bash, so $BASHPID is required here.
+    local dispatcher_pid_file="$MESSAGES_DIR/config/dispatcher.pid"
+    mkdir -p "$(dirname "$dispatcher_pid_file")"
+
+    (
+        echo "$BASHPID" > "$dispatcher_pid_file"
+        # Write the dispatcher startup flag so inject-bootup-context.py can
+        # identify this as the dispatcher session on SessionStart.
+        # The flag contains $BASHPID — the same PID that becomes the claude
+        # process PID after exec. We write before exec so the flag is always
+        # present when SessionStart fires. inject-bootup-context.py reads the
+        # flag, verifies the PID is alive via kill -0, consumes the flag, and
+        # injects dispatcher bootup context. Stale flags (dead PID) are ignored.
+        mkdir -p "$WORKSPACE_DIR/data"
+        echo "$BASHPID" > "$WORKSPACE_DIR/data/dispatcher-startup-flag"
+        exec claude --dangerously-skip-permissions \
+            --model sonnet \
+            --max-turns 150 \
+            -p "$init_prompt"
+    ) 2>&1 | tee -a "$LOG_DIR/claude-session.log" || claude_exit_code=$?
+
+    # Clean up PID file on exit — the process is gone, the file is stale.
+    # Note: if claude-persistent.sh's parent is SIGKILLed, this cleanup won't run,
+    # leaving a stale PID file. On next launch, the health check reads it, finds the
+    # PID dead via kill -0, treats any kill as no-op, and self-heals when the new PID
+    # overwrites the file at launch start.
+    rm -f "$dispatcher_pid_file" 2>/dev/null || true
+    log "Claude exited (exit_code=$claude_exit_code), PID file removed"
 
     return $claude_exit_code
 }
@@ -217,15 +629,69 @@ handle_exit() {
             log "HIBERNATING: Claude exited cleanly (hibernation). Will wait for wake signal."
             return 0
         else
-            # Claude exited cleanly but not in hibernate mode
-            # This can happen when --max-turns is exhausted
-            log "Claude exited cleanly (code 0) but not in hibernate mode. Will restart."
+            # Claude exited cleanly but mode is not "hibernate".
+            # Race condition guard: the MCP tool writes mode=hibernate then Claude
+            # exits, but if the health check fires between those two events it sees
+            # mode=active + stale WFM and triggers a false restart.
+            # Write mode=hibernate NOW (atomically, preserving existing fields) so
+            # the health check immediately sees the correct state.
+            log "Claude exited cleanly (code 0) but mode='${current_mode}' (not hibernate). Writing hibernate state before restart decision."
+            local now
+            now=$(date -Iseconds)
+            local tmp_state
+            tmp_state=$(mktemp "${STATE_FILE}.tmp.XXXXXX")
+            python3 -c "
+import json
+path = '$STATE_FILE'
+now = '$now'
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d['mode'] = 'hibernate'
+d['detail'] = 'clean exit, mode forced by wrapper (race condition guard)'
+d['updated_at'] = now
+with open('$tmp_state', 'w') as f:
+    json.dump(d, f, indent=2)
+    f.write('
+')
+" 2>/dev/null && mv -f "$tmp_state" "$STATE_FILE" || { rm -f "$tmp_state" 2>/dev/null; write_state "hibernate" "clean exit, mode forced by wrapper"; }
+            log "Hibernate state written atomically. Re-reading mode..."
+            current_mode=$(read_state_mode)
+            if [[ "$current_mode" == "hibernate" ]]; then
+                # Treat as intentional hibernation — wait for new messages
+                log "HIBERNATING: Clean exit treated as hibernation (mode forced by wrapper). Will wait for wake signal."
+                return 0
+            fi
+            # State write failed somehow — fall through to restart
+            log "State write did not yield hibernate mode (got: ${current_mode}). Will restart."
             write_state "restarting" "clean exit, max-turns likely exhausted"
+            # Reset auth failure tracking — a clean exit means auth is working
+            AUTH_FAIL_COUNT=0
+            AUTH_FAIL_ALERTED=false
             return 1
         fi
     else
         log "Claude exited with code $exit_code. Will restart after backoff."
         write_state "restarting" "exit_code=$exit_code"
+
+        # Detect auth failures from session log
+        if tail -5 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -q "authentication_error\|OAuth token has expired\|API usage limits"; then
+            AUTH_FAIL_COUNT=$((AUTH_FAIL_COUNT + 1))
+            if [[ $AUTH_FAIL_COUNT -ge 3 ]] && [[ "$AUTH_FAIL_ALERTED" != "true" ]]; then
+                AUTH_FAIL_ALERTED=true
+                send_telegram_alert "🔴 *Lobster Auth Failure*
+
+Claude cannot authenticate after $AUTH_FAIL_COUNT attempts.
+Auth is via CLAUDE_CODE_OAUTH_TOKEN in config.env.
+
+Fix: update CLAUDE_CODE_OAUTH_TOKEN in ~/lobster-config/config.env, then:
+  systemctl restart lobster-claude"
+                log "AUTH ALERT: Sent Telegram notification after $AUTH_FAIL_COUNT auth failures"
+            fi
+        fi
+
         return 1
     fi
 }
@@ -261,7 +727,29 @@ main() {
     log "State file: $STATE_FILE"
     log "================================================================"
 
+    # Lifecycle gate: only run in production mode.
+    # When LOBSTER_ENV is set to anything other than "production" (e.g. "dev" or
+    # "test"), the persistent session exits immediately. This lets the owner do SSH
+    # dev work without the production session health-checking and auto-restarting
+    # in the background. systemd starts the script but the script exits cleanly
+    # (exit 0), so the service stays in RemainAfterExit=yes without restart loops.
+    # Flip back to production by setting LOBSTER_ENV=production and restarting
+    # the service (or unsetting the var, since "production" is the default).
+    LOBSTER_ENV="${LOBSTER_ENV:-production}"
+    if [[ "$LOBSTER_ENV" != "production" ]]; then
+        log "LOBSTER_ENV=$LOBSTER_ENV — persistent session is disabled in non-production mode. Exiting."
+        exit 0
+    fi
+
     preflight
+
+    # Write boot timestamp before the first health-check can fire.
+    # This gives the health-check BOOT_GRACE_SECONDS to wait before
+    # expecting a running Claude process or a drained inbox.
+    write_boot_stamp
+
+    send_telegram_alert "🔄 *Lobster Starting*
+Claude persistent session initializing."
 
     local attempt=0
     local max_rapid_restarts=5
@@ -293,7 +781,6 @@ main() {
         fi
 
         # Launch Claude
-        write_state "active" "starting claude"
         launch_claude "$attempt"
         local exit_code=$?
 
@@ -301,6 +788,11 @@ main() {
         if handle_exit "$exit_code"; then
             # Clean hibernation - wait for new messages
             wait_for_wake
+            # Write a fresh boot stamp so the health-check's BOOT_GRACE_SECONDS
+            # suppression window activates for the upcoming wakeup launch.
+            # Without this, hibernate wakeups have no grace period and the
+            # stale-inbox check fires during the ~60-90s initialization window.
+            write_boot_stamp
             attempt=0  # Reset attempt counter after clean cycle
         else
             # Abnormal exit - brief pause before restart
@@ -318,4 +810,10 @@ main() {
 trap 'log "Received SIGTERM, shutting down..."; write_state "stopped" "sigterm"; exit 0' SIGTERM
 trap 'log "Received SIGINT, shutting down..."; write_state "stopped" "sigint"; exit 0' SIGINT
 
-main "$@"
+# Only run main when executed directly. When sourced (e.g. by a test harness
+# exercising kill_orphaned_mcp_processes/kill_orphaned_claude_processes in
+# isolation), skip the auto-run so the caller controls exactly what runs.
+# No behavior change for the normal systemd/tmux launch path.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

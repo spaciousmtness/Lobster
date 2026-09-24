@@ -151,18 +151,6 @@ class TestUpgradePreservesDataDirectories:
         after = json.loads(tasks_file.read_text())
         assert after["tasks"][0]["subject"] == "important task"
 
-    def test_jobs_json_preserved(self, simulated_install):
-        """Verify scheduled jobs.json is not overwritten on upgrade."""
-        jobs_file = simulated_install["lobster"] / "scheduled-tasks" / "jobs.json"
-        original = json.loads(jobs_file.read_text())
-        assert "morning-check" in original["jobs"]
-
-        if not jobs_file.exists():
-            jobs_file.write_text(json.dumps({"jobs": {}}))
-
-        after = json.loads(jobs_file.read_text())
-        assert "morning-check" in after["jobs"]
-
     def test_projects_directory_preserved(self, simulated_install):
         """Verify lobster-workspace/projects/ and its contents are never touched."""
         projects = simulated_install["projects"]
@@ -304,6 +292,26 @@ class TestUpgradePreservesContext:
         assert "jobs.json" in content, "upgrade.sh should back up jobs.json"
         assert "tasks.json" in content, "upgrade.sh should back up tasks.json"
 
+    def test_upgrade_sh_restarts_services_last(self, lobster_dir: Path):
+        """restart_services() restarts lobster-claude directly (issue #2275):
+        if upgrade.sh is running inside that same session (e.g. a subagent
+        doing "run lobster update"), the restart kills the script's own
+        process. It must therefore be the last step in main() so every step
+        whose result matters (migrations, health check) has already
+        completed and logged before the kill can happen."""
+        content = (lobster_dir / "scripts" / "upgrade.sh").read_text()
+        main_start = content.index("\nmain() {")
+        main_body = content[main_start:content.index("\nmain \"$@\"", main_start)]
+
+        restart_pos = main_body.index("restart_services")
+        migrations_pos = main_body.index("run_migrations")
+        health_check_pos = main_body.index("health_check")
+
+        assert migrations_pos < restart_pos, \
+            "run_migrations must run before restart_services (issue #2275)"
+        assert health_check_pos < restart_pos, \
+            "health_check must run before restart_services (issue #2275)"
+
 
 @pytest.mark.integration
 class TestMCPServerDirectoryInit:
@@ -316,11 +324,11 @@ class TestMCPServerDirectoryInit:
 
         # Pre-create some dirs with data (simulating existing install)
         inbox = messages / "inbox"
-        inbox.mkdir(parents=True)
+        inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "existing_msg.json").write_text('{"id": "keep_me"}')
 
         processed = messages / "processed"
-        processed.mkdir(parents=True)
+        processed.mkdir(parents=True, exist_ok=True)
         (processed / "old_msg.json").write_text('{"id": "archived"}')
 
         # Patch the constants and run the directory creation loop
@@ -399,7 +407,7 @@ class TestInFlightMessageSafety:
         ):
             from src.mcp.inbox_server import _recover_stale_processing
 
-            _recover_stale_processing(max_age_seconds=300)
+            _recover_stale_processing()
 
         assert not (processing / f"{msg['id']}.json").exists()
         assert (inbox / f"{msg['id']}.json").exists()
@@ -466,7 +474,7 @@ class TestInFlightMessageSafety:
         ):
             from src.mcp.inbox_server import _recover_stale_processing
 
-            _recover_stale_processing(max_age_seconds=300)
+            _recover_stale_processing()
 
         assert (processing / f"{msg['id']}.json").exists()
         assert not (inbox / f"{msg['id']}.json").exists()
@@ -518,7 +526,7 @@ class TestInFlightMessageSafety:
         ):
             from src.mcp.inbox_server import _recover_stale_processing, _recover_retryable_messages
 
-            _recover_stale_processing(max_age_seconds=300)
+            _recover_stale_processing()
             _recover_retryable_messages()
 
         # inbox: original + stale recovered + retry recovered = 3

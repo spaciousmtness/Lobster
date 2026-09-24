@@ -1,0 +1,745 @@
+"""Tests for bisque relay server v2 -- WS integration, auth, messages, replay, stress."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+import pytest
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+async def _get_session_token(base_url: str, bootstrap_token: str = "test-bootstrap-token") -> str:
+    """Exchange bootstrap token for session token via HTTP POST."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base_url}/auth/exchange",
+            json={"token": bootstrap_token},
+        ) as resp:
+            assert resp.status == 200
+            data = await resp.json()
+            return data["sessionToken"]
+
+
+async def _ws_connect(base_url: str):
+    """Create an aiohttp ClientSession + WS connection. Caller must close both."""
+    session = aiohttp.ClientSession()
+    ws = await session.ws_connect(f"{base_url}/")
+    return session, ws
+
+
+async def _auth_ws(base_url: str, token: str):
+    """Connect, auth, read auth_success + snapshot. Returns (session, ws, snapshot_data)."""
+    session, ws = await _ws_connect(base_url)
+    await ws.send_json({"v": 2, "type": "auth", "token": token})
+
+    msg = await asyncio.wait_for(ws.receive(), timeout=5)
+    data = json.loads(msg.data)
+    assert data["type"] == "auth_success"
+
+    msg = await asyncio.wait_for(ws.receive(), timeout=5)
+    snapshot = json.loads(msg.data)
+    assert snapshot["type"] == "snapshot"
+
+    return session, ws, snapshot
+
+
+async def _close(session, ws):
+    """Close ws and session."""
+    await ws.close()
+    await session.close()
+
+
+async def _receive_frame_of_type(ws, frame_type: str, timeout: float = 10) -> Any:
+    """Receive frames until one with the given type is found.
+
+    The relay server may send interstitial frames (e.g. typing indicators) before
+    the expected frame. This helper skips those and returns the first matching frame.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError(f"Timed out waiting for frame type '{frame_type}'")
+        msg = await asyncio.wait_for(ws.receive(), timeout=remaining)
+        data = json.loads(msg.data)
+        if data["type"] == frame_type:
+            return data
+
+
+# =============================================================================
+# HTTP auth exchange
+# =============================================================================
+
+
+class TestHTTPAuthExchange:
+    async def test_exchange_success(self, relay_server):
+        url = relay_server["ws_url"]
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{url}/auth/exchange", json={"token": "test-bootstrap-token"}) as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert "sessionToken" in data
+                assert data["email"] == "test@example.com"
+
+    async def test_exchange_invalid_token(self, relay_server):
+        url = relay_server["ws_url"]
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{url}/auth/exchange", json={"token": "bad"}) as resp:
+                assert resp.status == 401
+
+    async def test_exchange_missing_token(self, relay_server):
+        url = relay_server["ws_url"]
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{url}/auth/exchange", json={}) as resp:
+                assert resp.status == 400
+
+    async def test_exchange_invalid_json(self, relay_server):
+        url = relay_server["ws_url"]
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{url}/auth/exchange",
+                data=b"not json {{{",
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                assert resp.status == 400
+
+
+# =============================================================================
+# WebSocket auth
+# =============================================================================
+
+
+class TestWSAuth:
+    async def test_auth_success(self, relay_server):
+        url = relay_server["ws_url"]
+        token = relay_server["token_store"].create_session("ws@test.com")
+        session, ws = await _ws_connect(url)
+        try:
+            await ws.send_json({"v": 2, "type": "auth", "token": token})
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "auth_success"
+            assert data["email"] == "ws@test.com"
+        finally:
+            await _close(session, ws)
+
+    async def test_auth_timeout(self, relay_server):
+        url = relay_server["ws_url"]
+        session, ws = await _ws_connect(url)
+        try:
+            msg = await asyncio.wait_for(ws.receive(), timeout=10)
+            data = json.loads(msg.data)
+            assert data["type"] == "auth_error"
+        finally:
+            await _close(session, ws)
+
+    async def test_auth_invalid_token(self, relay_server):
+        url = relay_server["ws_url"]
+        session, ws = await _ws_connect(url)
+        try:
+            await ws.send_json({"v": 2, "type": "auth", "token": "invalid"})
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "auth_error"
+        finally:
+            await _close(session, ws)
+
+    async def test_auth_wrong_frame_type(self, relay_server):
+        url = relay_server["ws_url"]
+        session, ws = await _ws_connect(url)
+        try:
+            await ws.send_json({"v": 2, "type": "ping"})
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "auth_error"
+        finally:
+            await _close(session, ws)
+
+    async def test_snapshot_on_connect(self, relay_server):
+        url = relay_server["ws_url"]
+        token = relay_server["token_store"].create_session("snap@test.com")
+        session, ws, snapshot = await _auth_ws(url, token)
+        try:
+            assert snapshot["status"] == "idle"
+        finally:
+            await _close(session, ws)
+
+
+# =============================================================================
+# Messages
+# =============================================================================
+
+
+class TestMessages:
+    async def test_send_message_creates_inbox_file(self, relay_server):
+        url = relay_server["ws_url"]
+        dirs = relay_server["dirs"]
+        token = relay_server["token_store"].create_session("msg@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            await ws.send_json({"v": 2, "type": "send_message", "text": "Hello from test"})
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "ack"
+            assert "message_id" in data
+
+            inbox_files = list(dirs["inbox"].glob("bisque_*.json"))
+            assert len(inbox_files) >= 1
+            content = json.loads(inbox_files[0].read_text())
+            assert content["text"] == "Hello from test"
+            assert content["source"] == "bisque"
+        finally:
+            await _close(session, ws)
+
+    async def test_send_message_empty_rejected(self, relay_server):
+        url = relay_server["ws_url"]
+        token = relay_server["token_store"].create_session("empty@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            await ws.send_json({"v": 2, "type": "send_message", "text": "   "})
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "error"
+        finally:
+            await _close(session, ws)
+
+    async def test_send_message_too_long_rejected(self, relay_server):
+        url = relay_server["ws_url"]
+        token = relay_server["token_store"].create_session("long@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            await ws.send_json({"v": 2, "type": "send_message", "text": "x" * 33000})
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "error"
+            assert "too long" in data["message"].lower()
+        finally:
+            await _close(session, ws)
+
+    async def test_ping_pong(self, relay_server):
+        url = relay_server["ws_url"]
+        token = relay_server["token_store"].create_session("ping@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            await ws.send_json({"v": 2, "type": "ping"})
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "pong"
+        finally:
+            await _close(session, ws)
+
+    async def test_binary_frame_rejected(self, relay_server):
+        url = relay_server["ws_url"]
+        token = relay_server["token_store"].create_session("bin@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            await ws.send_bytes(b"\x00\x01\x02")
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "error"
+        finally:
+            await _close(session, ws)
+
+
+# =============================================================================
+# Event delivery (outbox → clients)
+# =============================================================================
+
+
+class TestEventDelivery:
+    async def test_outbox_file_delivered(self, relay_server):
+        url = relay_server["ws_url"]
+        dirs = relay_server["dirs"]
+        token = relay_server["token_store"].create_session("outbox@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            msg_data = {
+                "id": "out-1",
+                "source": "bisque",
+                "chat_id": "outbox@test.com",
+                "text": "Reply from Lobster",
+                "timestamp": "2025-01-01T00:00:00Z",
+            }
+            (dirs["bisque_outbox"] / "out-1.json").write_text(json.dumps(msg_data))
+
+            # The server sends a typing=false indicator before the message frame
+            # (BIS-122). Skip interstitial frames and wait for the message.
+            data = await _receive_frame_of_type(ws, "message", timeout=10)
+            assert data["text"] == "Reply from Lobster"
+            assert data["role"] == "assistant"
+        finally:
+            await _close(session, ws)
+
+    async def test_wire_event_delivered(self, relay_server):
+        url = relay_server["ws_url"]
+        dirs = relay_server["dirs"]
+        token = relay_server["token_store"].create_session("wire@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            event = {"type": "status", "status": "thinking", "detail": "Processing"}
+            (dirs["wire_events"] / "evt-1.json").write_text(json.dumps(event))
+
+            msg = await asyncio.wait_for(ws.receive(), timeout=10)
+            data = json.loads(msg.data)
+            assert data["type"] == "status"
+            assert data["status"] == "thinking"
+        finally:
+            await _close(session, ws)
+
+    async def test_multi_client_fan_out(self, relay_server):
+        """P3.3: When chat_id is absent, the event broadcasts to all clients.
+
+        Two clients with different emails both receive the frame when no
+        chat_id (target_email) is set.  If chat_id is present, only the
+        matching user's client receives it (tested in TestFanOutIsolation).
+        """
+        url = relay_server["ws_url"]
+        dirs = relay_server["dirs"]
+        store = relay_server["token_store"]
+
+        token1 = store.create_session("fan1@test.com")
+        token2 = store.create_session("fan2@test.com")
+
+        s1, ws1, _ = await _auth_ws(url, token1)
+        s2, ws2, _ = await _auth_ws(url, token2)
+
+        try:
+            # Omit chat_id so the event has no target_email → broadcasts to all
+            msg_data = {"id": "fan-1", "text": "Broadcast"}
+            (dirs["bisque_outbox"] / "fan-1.json").write_text(json.dumps(msg_data))
+
+            # Skip interstitial typing frames (BIS-122) and assert both clients
+            # receive the message frame.
+            d1 = await _receive_frame_of_type(ws1, "message", timeout=10)
+            d2 = await _receive_frame_of_type(ws2, "message", timeout=10)
+            assert d1["type"] == "message"
+            assert d2["type"] == "message"
+        finally:
+            await _close(s1, ws1)
+            await _close(s2, ws2)
+
+
+# =============================================================================
+# Replay
+# =============================================================================
+
+
+class TestReplay:
+    async def test_replay_missed_events(self, relay_server):
+        url = relay_server["ws_url"]
+        event_log = relay_server["event_log"]
+        store = relay_server["token_store"]
+
+        event_log.append("evt-old", json.dumps({"v": 2, "type": "status", "status": "idle", "id": "a", "ts": "t"}))
+        event_log.append("evt-new", json.dumps({"v": 2, "type": "status", "status": "thinking", "id": "b", "ts": "t"}))
+
+        token = store.create_session("replay@test.com")
+
+        session, ws = await _ws_connect(url)
+        try:
+            await ws.send_json({"v": 2, "type": "auth", "token": token, "last_event_id": "evt-old"})
+
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            assert json.loads(msg.data)["type"] == "auth_success"
+
+            # Should get replay, not snapshot
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "status"
+            assert data["status"] == "thinking"
+        finally:
+            await _close(session, ws)
+
+    async def test_stale_id_gets_snapshot(self, relay_server):
+        url = relay_server["ws_url"]
+        store = relay_server["token_store"]
+        token = store.create_session("stale@test.com")
+
+        session, ws = await _ws_connect(url)
+        try:
+            await ws.send_json({"v": 2, "type": "auth", "token": token, "last_event_id": "nonexistent"})
+
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            assert json.loads(msg.data)["type"] == "auth_success"
+
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            assert json.loads(msg.data)["type"] == "snapshot"
+        finally:
+            await _close(session, ws)
+
+    async def test_no_last_event_id_gets_snapshot(self, relay_server):
+        url = relay_server["ws_url"]
+        store = relay_server["token_store"]
+        token = store.create_session("new@test.com")
+
+        session, ws = await _ws_connect(url)
+        try:
+            await ws.send_json({"v": 2, "type": "auth", "token": token})
+
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            assert json.loads(msg.data)["type"] == "auth_success"
+
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            assert json.loads(msg.data)["type"] == "snapshot"
+        finally:
+            await _close(session, ws)
+
+
+# =============================================================================
+# Edge cases
+# =============================================================================
+
+
+class TestEdgeCases:
+    async def test_rapid_messages(self, relay_server):
+        url = relay_server["ws_url"]
+        store = relay_server["token_store"]
+        token = store.create_session("rapid@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            for i in range(50):
+                await ws.send_json({"v": 2, "type": "send_message", "text": f"Message {i}"})
+
+            acks = []
+            for _ in range(50):
+                msg = await asyncio.wait_for(ws.receive(), timeout=10)
+                data = json.loads(msg.data)
+                assert data["type"] == "ack"
+                acks.append(data)
+
+            assert len(acks) == 50
+        finally:
+            await _close(session, ws)
+
+    async def test_large_message(self, relay_server):
+        url = relay_server["ws_url"]
+        store = relay_server["token_store"]
+        token = store.create_session("large@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            await ws.send_json({"v": 2, "type": "send_message", "text": "x" * 30000})
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            assert json.loads(msg.data)["type"] == "ack"
+        finally:
+            await _close(session, ws)
+
+    async def test_invalid_json(self, relay_server):
+        url = relay_server["ws_url"]
+        store = relay_server["token_store"]
+        token = store.create_session("json@test.com")
+        session, ws, _ = await _auth_ws(url, token)
+
+        try:
+            await ws.send_str("not valid json {{{")
+            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            data = json.loads(msg.data)
+            assert data["type"] == "error"
+        finally:
+            await _close(session, ws)
+
+
+# =============================================================================
+# Stress tests
+# =============================================================================
+
+
+@pytest.mark.stress
+class TestStress:
+    async def test_concurrent_connections(self, relay_server):
+        url = relay_server["ws_url"]
+        store = relay_server["token_store"]
+
+        connections = []
+        for i in range(20):
+            token = store.create_session(f"stress{i}@test.com")
+            s, ws, _ = await _auth_ws(url, token)
+            connections.append((s, ws))
+
+        try:
+            for _, ws in connections:
+                await ws.send_json({"v": 2, "type": "ping"})
+
+            for _, ws in connections:
+                msg = await asyncio.wait_for(ws.receive(), timeout=10)
+                assert json.loads(msg.data)["type"] == "pong"
+        finally:
+            for s, ws in connections:
+                await _close(s, ws)
+
+    async def test_rapid_events_to_multiple_clients(self, relay_server):
+        url = relay_server["ws_url"]
+        dirs = relay_server["dirs"]
+        store = relay_server["token_store"]
+
+        connections = []
+        for i in range(5):
+            token = store.create_session(f"multi{i}@test.com")
+            s, ws, _ = await _auth_ws(url, token)
+            connections.append((s, ws))
+
+        try:
+            for i in range(20):
+                # No chat_id → broadcasts to all clients (P3.3 broadcast path)
+                msg_data = {"id": f"rapid-{i}", "text": f"Rapid {i}"}
+                (dirs["bisque_outbox"] / f"rapid-{i}.json").write_text(json.dumps(msg_data))
+                await asyncio.sleep(0.01)
+
+            for _, ws in connections:
+                received = []
+                # Each message is now preceded by a typing=false frame (BIS-122),
+                # so double the read budget to collect 20 messages from 40 frames.
+                for _ in range(40):
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=15)
+                        data = json.loads(msg.data)
+                        if data["type"] == "message":
+                            received.append(data)
+                    except asyncio.TimeoutError:
+                        break
+                assert len(received) >= 15
+        finally:
+            for s, ws in connections:
+                await _close(s, ws)
+
+
+# =============================================================================
+# P3.4: Health endpoint
+# =============================================================================
+
+
+class TestHealthEndpoint:
+    async def test_health_returns_ok(self, relay_server):
+        """GET /health returns 200 with status=ok."""
+        url = relay_server["ws_url"]
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{url}/health") as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "ok"
+                assert data["version"] == 2
+                assert "uptime_seconds" in data
+                assert "client_count" in data
+                assert "active_sessions" in data
+
+    async def test_health_bisque_relay_prefix(self, relay_server):
+        """GET /bisque-relay/health returns the same payload."""
+        url = relay_server["ws_url"]
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{url}/bisque-relay/health") as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "ok"
+
+    async def test_health_cors_header(self, relay_server):
+        """Health response includes CORS header so JS can read it."""
+        url = relay_server["ws_url"]
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{url}/health") as resp:
+                assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+
+    async def test_health_client_count_increments(self, relay_server):
+        """client_count in health response increments when a client connects."""
+        url = relay_server["ws_url"]
+        store = relay_server["token_store"]
+
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{url}/health") as resp:
+                before = (await resp.json())["client_count"]
+
+        token = store.create_session("health@test.com")
+        ws_session, ws, _ = await _auth_ws(url, token)
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"{url}/health") as resp:
+                    after = (await resp.json())["client_count"]
+
+            assert after == before + 1
+        finally:
+            await _close(ws_session, ws)
+
+    async def test_health_uptime_is_positive(self, relay_server):
+        """Uptime should be > 0 after a small delay."""
+        url = relay_server["ws_url"]
+        await asyncio.sleep(0.05)
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{url}/health") as resp:
+                data = await resp.json()
+                assert data["uptime_seconds"] > 0
+
+
+# =============================================================================
+# P3.6: Rate limiter unit tests
+# =============================================================================
+
+
+class TestRateLimiter:
+    """Unit tests for the _RateLimiter token-bucket implementation."""
+
+    def test_initial_requests_allowed(self):
+        from bisque.relay_server import _RateLimiter
+        rl = _RateLimiter(rate=10.0, capacity=3.0)
+        assert rl.is_allowed("1.2.3.4") is True
+        assert rl.is_allowed("1.2.3.4") is True
+        assert rl.is_allowed("1.2.3.4") is True
+
+    def test_burst_exhausted_then_blocked(self):
+        from bisque.relay_server import _RateLimiter
+        rl = _RateLimiter(rate=0.01, capacity=3.0)  # near-zero refill
+        # Drain the bucket
+        for _ in range(3):
+            rl.is_allowed("10.0.0.1")
+        # Next call should be blocked
+        assert rl.is_allowed("10.0.0.1") is False
+
+    def test_different_ips_isolated(self):
+        from bisque.relay_server import _RateLimiter
+        rl = _RateLimiter(rate=0.01, capacity=1.0)
+        rl.is_allowed("192.168.1.1")  # exhaust first IP
+        # Second IP should still be allowed (full bucket)
+        assert rl.is_allowed("192.168.1.2") is True
+
+    def test_tokens_refill_over_time(self):
+        import time
+        from bisque.relay_server import _RateLimiter
+        rl = _RateLimiter(rate=100.0, capacity=1.0)
+        rl.is_allowed("5.5.5.5")  # exhaust
+        assert rl.is_allowed("5.5.5.5") is False  # blocked immediately
+        time.sleep(0.02)  # 100 tok/s * 0.02s = 2 tokens refilled > 1
+        assert rl.is_allowed("5.5.5.5") is True
+
+    def test_purge_removes_stale_buckets(self):
+        import time
+        from bisque.relay_server import _RateLimiter
+        rl = _RateLimiter(rate=1.0, capacity=5.0)
+        rl.is_allowed("old.ip")
+        time.sleep(0.01)
+        removed = rl.purge_old(max_age=0.0)  # purge everything
+        assert removed >= 1
+        # Bucket is gone — next call gets a fresh full bucket
+        assert rl.is_allowed("old.ip") is True
+
+    def test_purge_keeps_recent_buckets(self):
+        import time
+        from bisque.relay_server import _RateLimiter
+        rl = _RateLimiter(rate=1.0, capacity=5.0)
+        rl.is_allowed("recent.ip")
+        # Purge with a generous max_age — recent bucket should survive
+        removed = rl.purge_old(max_age=60.0)
+        assert removed == 0
+
+
+# =============================================================================
+# P3.3: Per-user fan-out isolation
+# =============================================================================
+
+
+class TestFanOutIsolation:
+    async def test_message_only_reaches_target_user(self, relay_server):
+        """An outbox message with chat_id=A should only be delivered to client A."""
+        url = relay_server["ws_url"]
+        dirs = relay_server["dirs"]
+        store = relay_server["token_store"]
+
+        token_a = store.create_session("alice@test.com")
+        token_b = store.create_session("bob@test.com")
+
+        s_a, ws_a, _ = await _auth_ws(url, token_a)
+        s_b, ws_b, _ = await _auth_ws(url, token_b)
+
+        try:
+            # Publish a message targeted at alice
+            msg = {
+                "id": "iso-1",
+                "type": "message",
+                "text": "For Alice only",
+                "role": "assistant",
+                "chat_id": "alice@test.com",
+                "ts": "2025-01-01T00:00:00Z",
+            }
+            (dirs["bisque_outbox"] / "iso-1.json").write_text(json.dumps(msg))
+
+            # Alice should receive the message
+            data = await _receive_frame_of_type(ws_a, "message", timeout=10)
+            assert data["text"] == "For Alice only"
+
+            # Bob should NOT receive it — check for 0.5s then give up
+            bob_received = False
+            try:
+                msg_b = await asyncio.wait_for(ws_b.receive(), timeout=0.5)
+                data_b = json.loads(msg_b.data)
+                if data_b.get("type") == "message" and data_b.get("text") == "For Alice only":
+                    bob_received = True
+            except asyncio.TimeoutError:
+                pass
+            assert not bob_received, "Bob should not receive a message targeted at Alice"
+        finally:
+            await _close(s_a, ws_a)
+            await _close(s_b, ws_b)
+
+
+# =============================================================================
+# P3.12: JsonFormatter unit tests
+# =============================================================================
+
+
+class TestJsonFormatter:
+    def test_basic_output_is_valid_json(self):
+        import logging
+        from bisque.relay_server import _JsonFormatter
+        fmt = _JsonFormatter()
+        record = logging.LogRecord("test", logging.INFO, "", 0, "hello", [], None)
+        line = fmt.format(record)
+        parsed = json.loads(line)
+        assert isinstance(parsed, dict)
+
+    def test_required_fields_present(self):
+        import logging
+        from bisque.relay_server import _JsonFormatter
+        fmt = _JsonFormatter()
+        record = logging.LogRecord("mylogger", logging.WARNING, "", 0, "test msg", [], None)
+        parsed = json.loads(fmt.format(record))
+        assert parsed["level"] == "WARNING"
+        assert parsed["logger"] == "mylogger"
+        assert parsed["msg"] == "test msg"
+        assert "ts" in parsed
+
+    def test_timestamp_is_iso_format(self):
+        import logging
+        from bisque.relay_server import _JsonFormatter
+        from datetime import datetime
+        fmt = _JsonFormatter()
+        record = logging.LogRecord("x", logging.DEBUG, "", 0, "ts test", [], None)
+        parsed = json.loads(fmt.format(record))
+        # Should parse without raising
+        datetime.fromisoformat(parsed["ts"])
+
+    def test_exception_info_included(self):
+        import logging
+        import sys
+        from bisque.relay_server import _JsonFormatter
+        fmt = _JsonFormatter()
+        try:
+            raise ValueError("test error")
+        except ValueError:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord("x", logging.ERROR, "", 0, "error occurred", [], exc_info)
+        parsed = json.loads(fmt.format(record))
+        assert "exc" in parsed
+        assert "ValueError" in parsed["exc"]

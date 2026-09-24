@@ -1,20 +1,23 @@
 """
-Nightly Inference Pipeline: LLM synthesis, decay application, consolidation.
+Nightly Inference Pipeline: decay, contradiction detection, bridge sync, consolidation.
 
 This module orchestrates the nightly pass that:
-1. Consumes unprocessed observations
-2. Applies preference decay
-3. Detects new contradictions
-4. Refreshes the attention stack
-5. Syncs the markdown file layer
-6. Updates last_consolidation_at metadata
+1. Runs bridges (sync projects → arcs, priorities → attention)
+2. Refreshes narrative arcs from recent observations
+3. Applies preference decay
+4. Detects new contradictions
+5. Processes pending observations
+6. Refreshes the attention stack
+7. Takes temporal snapshots and detects drift
+8. Syncs the markdown file layer + context cache
+9. Updates last_consolidation_at metadata
 
 Called by: a scheduled job (nightly cron) or triggered via model_reflect.
 Depends on: all other user_model modules.
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from .db import (
@@ -23,7 +26,6 @@ from .db import (
     set_metadata_value,
 )
 from .markdown_sync import sync_all
-from .observation import observe_message
 from .prediction import refresh_attention_stack
 from .preference_graph import apply_decay
 from .self_knowledge import detect_contradictions, persist_new_contradictions
@@ -36,30 +38,37 @@ def run_consolidation(
 ) -> dict[str, Any]:
     """
     Run the full nightly consolidation pipeline.
-
-    Steps:
-    1. Apply preference decay
-    2. Detect and persist new contradictions
-    3. Process pending observations (mark as processed)
-    4. Refresh attention stack
-    5. Sync markdown file layer
-    6. Update last_consolidation_at
-
     Returns a summary dict.
     """
     summary: dict[str, Any] = {
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "steps": [],
     }
 
-    # Step 1: Apply preference decay
+    # Step 1: Bridge sync — pull projects and priorities into the user model
+    try:
+        from .bridges import run_bridges
+        bridge_results = run_bridges(conn, workspace_path)
+        summary["steps"].append({"step": "bridges", **bridge_results})
+    except Exception as e:
+        summary["steps"].append({"step": "bridges", "error": str(e)})
+
+    # Step 2: Refresh narrative arcs from recent observations
+    try:
+        from .narrative import refresh_arcs_from_observations
+        arc_results = refresh_arcs_from_observations(conn, hours=24 * days_since_last_run)
+        summary["steps"].append({"step": "arc_refresh", **arc_results})
+    except Exception as e:
+        summary["steps"].append({"step": "arc_refresh", "error": str(e)})
+
+    # Step 3: Apply preference decay
     try:
         decayed = apply_decay(conn, days_since_last_run=days_since_last_run)
         summary["steps"].append({"step": "decay", "nodes_affected": decayed})
     except Exception as e:
         summary["steps"].append({"step": "decay", "error": str(e)})
 
-    # Step 2: Detect contradictions
+    # Step 4: Detect contradictions
     try:
         new_contradictions = detect_contradictions(conn)
         if new_contradictions:
@@ -76,7 +85,7 @@ def run_consolidation(
     except Exception as e:
         summary["steps"].append({"step": "contradiction_detection", "error": str(e)})
 
-    # Step 3: Process pending observations
+    # Step 5: Process pending observations
     try:
         pending = get_unprocessed_observations(conn, limit=500)
         if pending:
@@ -91,7 +100,7 @@ def run_consolidation(
     except Exception as e:
         summary["steps"].append({"step": "observation_processing", "error": str(e)})
 
-    # Step 4: Refresh attention stack
+    # Step 6: Refresh attention stack
     try:
         att_ids = refresh_attention_stack(conn)
         summary["steps"].append({
@@ -101,7 +110,35 @@ def run_consolidation(
     except Exception as e:
         summary["steps"].append({"step": "attention_refresh", "error": str(e)})
 
-    # Step 5: Sync markdown file layer
+    # Step 7: Temporal snapshot and drift detection (non-critical)
+    try:
+        from .temporal import (
+            take_weekly_snapshot_if_due,
+            detect_drift_since_last_snapshot,
+            persist_drift_records,
+        )
+        snapshot_id = take_weekly_snapshot_if_due(conn)
+        if snapshot_id:
+            drifts = detect_drift_since_last_snapshot(conn)
+            if drifts:
+                drift_ids = persist_drift_records(conn, drifts)
+                summary["steps"].append({
+                    "step": "temporal_snapshot",
+                    "snapshot_id": snapshot_id,
+                    "drifts_detected": len(drift_ids),
+                })
+            else:
+                summary["steps"].append({
+                    "step": "temporal_snapshot",
+                    "snapshot_id": snapshot_id,
+                    "drifts_detected": 0,
+                })
+        else:
+            summary["steps"].append({"step": "temporal_snapshot", "skipped": True})
+    except Exception as e:
+        summary["steps"].append({"step": "temporal_snapshot", "error": str(e)})
+
+    # Step 8: Sync markdown file layer + context cache
     if workspace_path:
         try:
             sync_results = sync_all(conn, workspace_path)
@@ -112,8 +149,16 @@ def run_consolidation(
         except Exception as e:
             summary["steps"].append({"step": "markdown_sync", "error": str(e)})
 
-    # Step 6: Update metadata
-    now_iso = datetime.utcnow().isoformat()
+        # Write pre-computed context cache
+        try:
+            from .bridges import write_context_cache
+            write_context_cache(conn, workspace_path)
+            summary["steps"].append({"step": "context_cache", "status": "written"})
+        except Exception as e:
+            summary["steps"].append({"step": "context_cache", "error": str(e)})
+
+    # Step 9: Update metadata
+    now_iso = datetime.now(timezone.utc).isoformat()
     set_metadata_value(conn, "last_consolidation_at", now_iso)
     summary["completed_at"] = now_iso
 

@@ -1,50 +1,188 @@
 #!/usr/bin/expect -f
 #
-# Claude wrapper script - Automatically accepts bypass permissions dialog
-# and starts Claude with the Lobster main loop.
+# Claude wrapper script (debug/interactive mode) - Automatically accepts the
+# bypass permissions dialog and starts Claude with the Lobster main loop,
+# then hands over terminal control for interactive use.
+#
+# This script is used when LOBSTER_DEBUG=true. It provides a full interactive
+# Claude REPL so that `lobster attach` gives a real interactive session where
+# you can type commands directly to Claude.
+#
+# Environment: the lobster-claude systemd service loads config.env via
+# EnvironmentFile directives before launching this script, so all config
+# variables (TELEGRAM_BOT_TOKEN, etc.) are already in the environment.
+# The variables below (LOBSTER_MAIN_SESSION, etc.) are set explicitly here
+# to match what claude-persistent.sh sets, ensuring the same MCP tools and
+# CLAUDE.md behaviour from the Telegram side.
+#
+# Robustness notes:
+# - Claude's interactive UI renders with ANSI escape codes. The ❯ prompt
+#   character (U+276F) is matched via regex in a loop to handle cases where
+#   the first render cycle contains the character before the UI is fully settled.
+# - A 60s timeout gives plenty of headroom for slow startup (API calls,
+#   auth checks, initial render).
+# - We send the init prompt, sleep, then send a bare Enter in case the first
+#   carriage return didn't register (observed intermittently on some terminals).
+# - LOBSTER_MAIN_SESSION=1 is required by the MCP inbox_server session guard.
+# - CLAUDE_CODE_SUBAGENT_MODEL and CLAUDE_AUTOCOMPACT_PCT_OVERRIDE set cost
+#   and quality defaults inherited by all subagents.
 #
 
-set timeout 30
+set timeout 60
+
+# Session isolation guard: mark this as the designated main Lobster session.
+# The MCP inbox_server.py checks for this before allowing inbox monitoring and
+# outbox writes.
+set env(LOBSTER_MAIN_SESSION) 1
+
+# Dispatcher runs on Sonnet for cost efficiency; subagents that don't specify
+# an explicit model inherit this.
+set env(CLAUDE_CODE_SUBAGENT_MODEL) sonnet
+
+# Trigger context compaction at 80% capacity instead of default 95%.
+set env(CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) 80
+
+# Send startup alert via Telegram (mirrors what claude-persistent.sh does).
+# Read bot token and first allowed user from config.env; curl directly so the
+# alert fires before Claude is even spawned — same semantics as the persistent
+# mode alert.
+set config_file [file join $::env(HOME) "lobster-config" "config.env"]
+if {[file readable $config_file]} {
+    set bot_token [exec sh -c "grep '^TELEGRAM_BOT_TOKEN=' [set config_file] | cut -d= -f2-"]
+    set chat_id   [exec sh -c "grep '^TELEGRAM_ALLOWED_USERS=' [set config_file] | cut -d= -f2- | cut -d, -f1"]
+    set bot_token [string trim $bot_token]
+    set chat_id   [string trim $chat_id]
+    if {$bot_token ne "" && $chat_id ne ""} {
+        # Ensure emoji in the message text is encoded correctly on non-UTF-8 locales.
+        encoding system utf-8
+        catch {
+            exec curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
+                --data-urlencode "chat_id=${chat_id}" \
+                --data-urlencode "text=\uD83D\uDD04 *Lobster Starting* (debug mode)\nClaude interactive session initializing." \
+                --data-urlencode "parse_mode=Markdown" \
+                --max-time 10
+        }
+    }
+}
 
 # Start Claude with bypass permissions
 spawn claude --dangerously-skip-permissions
 
-# Wait for either the permissions dialog OR the ready prompt
+# Write the dispatcher startup flag so inject-bootup-context.py can identify
+# this session as the dispatcher. Mirrors what claude-persistent.sh does before
+# exec-ing claude: writes the launcher PID to
+# ~/lobster-workspace/data/dispatcher-startup-flag.
+#
+# In debug mode, [exp_pid] returns the PID of the spawned claude process. We
+# write it immediately after spawn so the flag is present before Claude's
+# SessionStart hook fires (the hook fires during Claude's startup sequence,
+# well after spawn returns). inject-bootup-context.py checks kill -0 on this
+# PID to confirm liveness, then deletes the flag — exactly the same contract
+# as persistent mode.
+#
+# NOTE: use [exp_pid] — NOT $spawn_pid. In Tcl/expect, $spawn_pid does not
+# exist as a variable; it produces a "can't read spawn_pid: no such variable"
+# error that is silently swallowed by catch, leaving the flag file empty (0
+# bytes). [exp_pid] is the correct expect built-in for the spawned process PID.
+#
+# Without this write, is_dispatcher() returns False for every debug-mode session
+# because the flag never exists, causing thinking-heartbeat.py to skip the
+# heartbeat write, which triggers the health-check cascade restart loop.
+set workspace [expr {[info exists ::env(LOBSTER_WORKSPACE)] ? $::env(LOBSTER_WORKSPACE) : "$::env(HOME)/lobster-workspace"}]
+set flag_dir [file join $workspace "data"]
+set flag_file [file join $flag_dir "dispatcher-startup-flag"]
+catch { file mkdir $flag_dir }
+catch {
+    set fh [open $flag_file w]
+    puts $fh [exp_pid]
+    close $fh
+}
+
+# Write the dispatcher.pid file, mirroring scripts/claude-persistent.sh
+# (which writes $MESSAGES_DIR/config/dispatcher.pid right before exec-ing
+# claude). health-check-v3.sh's check_session_age() reads this file to find
+# the PID to send a graceful SIGTERM to once the session passes
+# SESSION_AGE_LIMIT_SECONDS.
+#
+# Before this fix, claude-wrapper.exp never wrote dispatcher.pid, so the
+# graceful SESSION AGE LIMIT restart path could never find a PID while
+# running in debug mode (LOBSTER_DEBUG=true) — it silently logged
+# "no dispatcher.pid — cannot send SIGTERM" and took no action, every
+# 4-minute health-check tick, for as long as the session stayed over-age
+# (see issue #2196: 4,148 occurrences in health-check.log since 2026-06-07).
+#
+# Same LOBSTER_MESSAGES fallback as claude-persistent.sh/health-check-v3.sh
+# (MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}") — must stay in sync
+# with both so the writer and reader always agree on the path.
+set messages_dir [expr {[info exists ::env(LOBSTER_MESSAGES)] ? $::env(LOBSTER_MESSAGES) : "$::env(HOME)/messages"}]
+set dispatcher_pid_dir [file join $messages_dir "config"]
+set dispatcher_pid_file [file join $dispatcher_pid_dir "dispatcher.pid"]
+catch { file mkdir $dispatcher_pid_dir }
+catch {
+    set pid_fh [open $dispatcher_pid_file w]
+    puts $pid_fh [exp_pid]
+    close $pid_fh
+}
+
+# Wait for either the permissions dialog OR the ready prompt.
+#
+# The ❯ (U+276F) character appears in the prompt area surrounded by ANSI escape
+# codes. Expect's regex engine sees the raw bytes (including escapes), so we
+# match the Unicode codepoint directly. "Try \"" catches the welcome screen
+# hint text as an alternative anchor.
+#
+# Note: the expect regex engine disables the "gate keeper" performance
+# optimisation for Unicode patterns, so matching may take a few render cycles
+# (each cycle is ~50 ms) — this is normal and harmless.
 expect {
     "Yes, I accept" {
-        # Permissions dialog appeared - navigate and accept
+        # Permissions dialog appeared - navigate down to accept button and press Enter
         send "\033\[B"
         sleep 0.5
         send "\r"
-        # Now wait for the prompt
+        # Wait for the main prompt after dialog is dismissed
         expect {
-            -re "❯|Try \"" {
+            -re {❯|Try "} {
+                # Prompt appeared — give the UI one more render cycle to settle
                 sleep 2
             }
             timeout {
-                puts "Timeout waiting for Claude prompt after dialog"
+                puts "Timeout waiting for Claude prompt after permissions dialog"
                 exit 1
             }
         }
     }
-    -re "❯|Try \"" {
-        # Already at prompt - no dialog shown
+    -re {❯|Try "} {
+        # Already at prompt - no dialog shown (--dangerously-skip-permissions active)
+        # Give the UI one render cycle to settle before sending input
         sleep 2
     }
     timeout {
-        puts "Timeout waiting for Claude"
+        puts "Timeout waiting for Claude to start (60s)"
         exit 1
     }
 }
 
-# Send the initialization command
+# Send the initialization command.
+# This instructs Claude to read the project instructions and enter its main loop.
 send "Read CLAUDE.md and begin your main loop. Call wait_for_messages to start listening for Telegram messages. Never exit.\r"
 
-# Wait briefly for Claude to start processing
+# Wait briefly for Claude to accept the input and begin processing.
+# The render cycle after sending is ~100-300 ms; 3 s is generous.
 sleep 3
 
-# Send another Enter in case the first one didn't register
+# Safety: send a bare Enter in case the carriage return above was dropped
+# (observed intermittently when the terminal emulator is still initialising).
 send "\r"
 
-# Hand over control - Claude runs forever
+# Hand over terminal control — Claude runs indefinitely.
+# The expect process stays alive so the spawned claude process is not orphaned.
 interact
+
+# interact returns once the spawned claude process exits (or EOF). Clean up
+# dispatcher.pid now that the PID it names is gone — mirrors
+# claude-persistent.sh's `rm -f "$dispatcher_pid_file"` after its claude
+# process exits. Leaving a stale dispatcher.pid around risks a future,
+# unrelated process being assigned the same PID and incorrectly targeted by
+# health-check-v3.sh's check_session_age() SIGTERM.
+catch { file delete $dispatcher_pid_file }
