@@ -28,12 +28,14 @@ allowed: command must be literal", if the command contains any of
 `* ? [ { $ \\` ' "`, a ".." path component, the word cd/pushd/popd, or if
 the stdin cwd doesn't resolve inside the workspace -- no exceptions, no
 grant helps. Otherwise the command is literal: every whitespace/operator-
-split token is resolved as a path (relative ones against cwd, a leading
-"~" against home) and judged with the same hard-deny check a file tool's
-path argument gets; any hit denies outright, no hits falls to the ordinary
-one-shot grant. There is no wildcard/quoting obfuscation scan any more --
-banning the characters that make one possible is simpler and cheaper than
-trying to out-guess them.
+split token, AND every piece of it split further on `@ : , +` (round 3
+fix-up -- catches curl's `@path`, rsync's `host:path`, and a `,`/`+`-joined
+argument gluing a path to something else), is resolved as a path (relative
+ones against cwd, a leading "~" against home) and judged with the same
+hard-deny check a file tool's path argument gets; any hit denies outright,
+no hits falls to the ordinary one-shot grant. There is no wildcard/quoting
+obfuscation scan any more -- banning the characters that make one possible
+is simpler and cheaper than trying to out-guess them.
 
 Every relative path argument (and a Glob/Grep pattern's fixed base) resolves
 against the stdin `cwd`, not the workspace -- a Bash-adjacent tool call
@@ -200,6 +202,20 @@ def _bash_tokenize(command: str) -> list[str]:
     return [t for t in _BASH_SPLIT_RE.split(command) if t]
 
 
+# A token surviving the first split can still carry a path glued to
+# something else via a convention the first split doesn't know about:
+# curl's `@path` (read-this-file), rsync's `host:path`, a bare `,`-joined
+# tar argument, a `+`-joined one. `--flag=value` is already handled by the
+# first split (`=` is one of its operators), so a token like
+# `--data-binary=@path` already arrives here as two separate tokens
+# (`--data-binary` and `@path`) before this second split ever runs.
+_BASH_SUBTOKEN_SPLIT_RE = re.compile(r"[@:,+]+")
+
+
+def _bash_subtokens(token: str) -> list[str]:
+    return [t for t in _BASH_SUBTOKEN_SPLIT_RE.split(token) if t]
+
+
 def _decide_bash(
     tool_input: dict,
     home: Path,
@@ -215,9 +231,12 @@ def _decide_bash(
         return "deny", DENY_BASH_MUST_BE_LITERAL
 
     for token in _bash_tokenize(command):
-        resolved = _resolve(token, resolved_cwd, home)
-        if _is_hard_denied(resolved, home, workspace, messages):
-            return "deny", DENY_NEVER_ALLOWED
+        pieces = [token]
+        pieces.extend(_bash_subtokens(token))
+        for piece in pieces:
+            resolved = _resolve(piece, resolved_cwd, home)
+            if _is_hard_denied(resolved, home, workspace, messages):
+                return "deny", DENY_NEVER_ALLOWED
 
     k = approvals.key("Bash", tool_input)
     if approvals.consume(k, approvals_path, now):
