@@ -17,6 +17,7 @@ mkdir -p "$TMP/bin" "$TMP/ws" "$TMP/msgs"
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 for a in "$@"; do printf '%s\n' "$a"; done
+printf 'ENABLE_TOOL_SEARCH=%s\n' "${ENABLE_TOOL_SEARCH-<unset>}"
 EOF
 cat > "$TMP/bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
@@ -43,13 +44,14 @@ run_launch() {
     ) 2>&1
 }
 
-MAC='--setting-sources local --settings $HOME/lobster/macos/claude-settings.json --mcp-config $HOME/lobster/macos/mcp.json --strict-mcp-config --permission-mode dontAsk --append-system-prompt-file $HOME/lobster/macos/CLAUDE.mac.md'
+MAC='--setting-sources= --settings $HOME/lobster/macos/claude-settings.json --mcp-config $HOME/lobster/macos/mcp.json --strict-mcp-config --permission-mode dontAsk --append-system-prompt-file $HOME/lobster/macos/CLAUDE.mac.md'
 
 out="$(run_launch "$MAC")"
 has "$out" "--settings" && ok "mac run passes --settings" || bad "mac run passes --settings: $out"
 has "$out" "--dangerously-skip-permissions" && bad "mac run must not skip permissions" || ok "mac run does not skip permissions"
 has "$out" "$HOME/lobster/macos/claude-settings.json" && ok "literal \$HOME in flags expands" || bad "literal \$HOME in flags expands: $out"
 has "$out" "dontAsk" && ok "mac run passes dontAsk" || bad "mac run passes dontAsk"
+has "$out" "ENABLE_TOOL_SEARCH=false" && ok "mac run exports ENABLE_TOOL_SEARCH=false" || bad "mac run tool search: $out"
 has "$out" "sonnet" && has "$out" "150" && has "$out" "the prompt" && ok "mac run keeps model, max-turns, prompt" || bad "mac run keeps model, max-turns, prompt"
 
 out="$(run_launch "--settings /abs/path/claude-settings.json --permission-mode dontAsk")"
@@ -58,9 +60,21 @@ has "$out" "/abs/path/claude-settings.json" && ok "pre-expanded absolute path pa
 out="$(run_launch '--mcp-config ${HOME}/lobster/macos/mcp.json')"
 has "$out" "$HOME/lobster/macos/mcp.json" && ok "literal \${HOME} in flags expands" || bad "\${HOME} form: $out"
 
+out="$(run_launch "   ")"
+[[ "$(sed -n 1p <<<"$out")" == "--dangerously-skip-permissions" ]] && ok "whitespace-only flags fall back to default" || bad "whitespace-only fallback: $out"
+
+# bash 5.2 patsub_replacement: an & in $HOME must not be replaced by the match
+out="$(HOME="$TMP/a&b" run_launch '--settings $HOME/s.json')"
+has "$out" "$TMP/a&b/s.json" && ok "\$HOME with & replaced literally" || bad "& in HOME: $out"
+
+# The setting-sources= form (no file-based sources) must survive word splitting
+out="$(run_launch '--setting-sources= --settings /x.json')"
+has "$out" "--setting-sources=" && ok "--setting-sources= passes as one word" || bad "setting-sources=: $out"
+
 out="$(run_launch "__UNSET__")"
 has "$out" "--dangerously-skip-permissions" && ok "unset falls back to --dangerously-skip-permissions" || bad "unset fallback: $out"
 has "$out" "--settings" && bad "unset run must not pass --settings" || ok "unset run passes no --settings"
+has "$out" "ENABLE_TOOL_SEARCH=<unset>" && ok "linux run leaves ENABLE_TOOL_SEARCH alone" || bad "linux tool search: $out"
 [[ "$(sed -n 1p <<<"$out")" == "--dangerously-skip-permissions" ]] && ok "unset run: flag is first arg" || bad "unset run first arg: $out"
 
 # Orphan cleanup uses LOBSTER_CLAUDE_MATCH

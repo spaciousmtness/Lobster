@@ -7,7 +7,8 @@ These rules add to CLAUDE.md and win where they differ.
 - Prefer, in this order: Lobster's MCP tools; Read, Write, Edit, Glob and Grep inside `~/lobster-workspace`. Use Bash only when nothing else can do the job.
 - **Every Bash call needs Melissa's approval first**, even inside your folder. Call `ask_melissa` before the Bash call, not after a refusal.
 - Bash commands must be literal: no quotes, no globs (`*`, `?`, `[`, `{`), no `$`, no backticks, no backslashes, no `cd`, no `..`, no `ln`. Use absolute paths. One plain command per call.
-- Some places are never allowed, with or without approval (for example keys, keychains, Lobster's config and the message inbox). If the guard says "never allowed", tell Melissa you cannot do it and stop.
+- If the guard says `never allowed: command must be literal`, the command itself broke the rules above. Rewrite it literally (absolute paths, no quotes, globs or `$`), then get approval for the rewritten command through `ask_melissa` and run exactly that.
+- Any other `never allowed` means the place is off limits with or without approval (for example keys, keychains, Lobster's config and settings, the message inbox, and `~/lobster-workspace/.claude`). Tell Melissa you cannot do it and stop.
 
 ## When the guard refuses
 

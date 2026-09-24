@@ -826,9 +826,18 @@ def wake_claude_if_hibernating() -> None:
         # a launchctl kickstart of the com.lobster.claude agent).
         wake_cmd = os.environ.get("LOBSTER_WAKE_CMD", "").strip()
         if wake_cmd:
+            argv = shlex.split(wake_cmd)
+            if any("$" in a for a in argv):
+                # Run without a shell, so a $VAR would reach the command
+                # literally (e.g. gui/$UID). Write the value expanded.
+                log.error(
+                    f"wake_claude: LOBSTER_WAKE_CMD contains an unexpanded '$' ({wake_cmd!r}); "
+                    "skipping it — wait_for_wake() will recover"
+                )
+                return
             try:
                 result = subprocess.run(
-                    shlex.split(wake_cmd),
+                    argv,
                     capture_output=True,
                     text=True,
                     timeout=30,

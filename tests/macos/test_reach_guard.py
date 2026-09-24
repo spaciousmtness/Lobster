@@ -685,3 +685,40 @@ def test_bash_link_words_file_scheme_percent_denied_even_with_grant(env, fmt):
 def test_bash_ordinary_commands_still_allowed_once_with_grant(env, command):
     decision, _ = granted(env, "Bash", {"command": command})
     assert decision == "allow"
+
+# Task 4 fix round 1: <workspace>/.claude holds settings.local.json, which
+# Claude Code loads on the next start -- writing it would let the agent
+# disable its own hooks. Hard-denied for every tool, grant or no grant.
+@pytest.mark.parametrize("tool,p", [
+    ("Write", ".claude/settings.local.json"),
+    ("Edit", ".claude/settings.local.json"),
+    ("Write", ".claude/settings.json"),
+    ("Write", ".CLAUDE/Settings.Local.json"),
+    ("Read", ".claude/settings.local.json"),
+])
+def test_workspace_dot_claude_hard_denied(env, tool, p):
+    home, ws, ap = env
+    inp = {"file_path": str(ws / p)}
+    if tool == "Edit":
+        inp.update(old_string="a", new_string="b")
+    approvals.grant(approvals.key(tool, inp), ap)
+    assert d(env, tool, inp) == "deny"
+    assert reach_guard.decide(tool, inp, home, ws, ap, time.time())[1] == reach_guard.DENY_NEVER_ALLOWED
+
+@pytest.mark.parametrize("cmd", [
+    "cp note.json .claude/settings.local.json",
+    "mkdir .claude",
+    "touch .Claude/settings.local.json",
+    "cp note.json {ws}/.claude/settings.local.json",
+])
+def test_bash_workspace_dot_claude_hard_denied(env, cmd):
+    home, ws, ap = env
+    inp = {"command": cmd.format(ws=ws)}
+    approvals.grant(approvals.key("Bash", inp), ap)
+    assert reach_guard.decide("Bash", inp, home, ws, ap, time.time()) == ("deny", reach_guard.DENY_NEVER_ALLOWED)
+
+def test_workspace_root_still_searchable(env):
+    home, ws, _ = env
+    assert d(env, "Grep", {"pattern": "x"}) == "allow"
+    assert d(env, "Glob", {"pattern": "**/*.md"}) == "allow"
+    assert d(env, "Write", {"file_path": str(ws / "claude-notes.md")}) == "allow"

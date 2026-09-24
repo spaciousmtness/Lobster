@@ -473,11 +473,25 @@ kill_orphaned_mcp_processes() {
 exec_claude_dispatcher() {
     local prompt="$1"
     local -a flags=()
-    read -r -a flags <<< "${LOBSTER_CLAUDE_FLAGS:---dangerously-skip-permissions}"
-    local i
+    read -r -a flags <<< "${LOBSTER_CLAUDE_FLAGS:-}"
+    if [[ ${#flags[@]} -eq 0 ]]; then
+        # Unset, empty or whitespace-only: the Linux default.
+        flags=(--dangerously-skip-permissions)
+    else
+        # Mac path. MCP tool search loads tools through a ToolSearch tool the
+        # reach guard refuses; also set in macos/claude-settings.json "env".
+        export ENABLE_TOOL_SEARCH=false
+    fi
+    local i w
     for i in "${!flags[@]}"; do
-        flags[$i]="${flags[$i]//\$\{HOME\}/$HOME}"
-        flags[$i]="${flags[$i]//\$HOME/$HOME}"
+        # Literal $HOME / ${HOME} -> the real home. Prefix/suffix trimming
+        # instead of ${w//pat/rep}: bash 5.2's patsub_replacement would turn
+        # a & in $HOME into the matched text, and bash 3.2 (macOS /bin/bash)
+        # keeps quotes in the replacement literally.
+        w="${flags[$i]}"
+        while [[ "$w" == *'${HOME}'* ]]; do w="${w%%'${HOME}'*}$HOME${w#*'${HOME}'}"; done
+        while [[ "$w" == *'$HOME'* ]]; do w="${w%%'$HOME'*}$HOME${w#*'$HOME'}"; done
+        flags[$i]="$w"
     done
     exec claude "${flags[@]}" \
         --model sonnet \

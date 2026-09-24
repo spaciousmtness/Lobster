@@ -8,7 +8,7 @@ Claude Code calls this before every tool use. In order (non-Bash tools):
       grant
   1. a hard-denied location is denied no matter what, grant or no grant
      ("never allowed") -- checked against `home` AND against the `messages`
-     argument (inbox/config under either)
+     argument (inbox/config under either), plus <workspace>/.claude
   6. for a recursive tool (Grep/Glob/LS), a target that merely CONTAINS a
      hard-denied location (relative to home OR relative to messages -- so
      ~/messages itself, or a custom/symlinked messages root, is covered
@@ -100,6 +100,14 @@ HARD_DENIED_GLOB_RELATIVE = (
 # location, and a symlinked one, neither of which the home-relative entries
 # above can see.
 MESSAGES_HARD_DENIED_SUBFOLDERS = ("inbox", "config")
+
+# <workspace>/.claude, relative to the `workspace` argument. Claude Code
+# loads <cwd>/.claude/settings*.json on start, so a write there could turn
+# off this very hook on the next restart. Only the folder itself and what is
+# under it: naming the workspace root (Grep with no path, `ls .`) stays
+# allowed, and the sandbox's denyWrite on the same folder covers a recursive
+# write into it.
+WORKSPACE_HARD_DENIED_SUBFOLDERS = (".claude",)
 
 # Outside the workspace, a file whose name merely looks like a secret is
 # treated as one -- catches stray credential files hard-denial didn't
@@ -484,6 +492,10 @@ def _is_hard_denied(resolved: Path, home: Path, workspace: Path, messages: Path)
     # not only when messages happens to live at home/"messages".
     messages_rel = _relative_parts_casefold(resolved, messages)
     if messages_rel and messages_rel[0].casefold() in ("inbox", "config"):
+        return True
+
+    workspace_rel = _relative_parts_casefold(resolved, workspace)
+    if workspace_rel and workspace_rel[0].casefold() in WORKSPACE_HARD_DENIED_SUBFOLDERS:
         return True
 
     if not _inside_casefold(resolved, workspace):

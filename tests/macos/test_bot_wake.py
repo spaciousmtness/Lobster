@@ -81,3 +81,18 @@ def test_process_match_default(monkeypatch):
     with patch.object(bot.subprocess, "run", run):
         assert bot._is_claude_running() is False
     assert run.call_args.args[0] == ["pgrep", "-f", "claude.*--dangerously-skip-permissions"]
+
+
+def test_wake_cmd_with_unexpanded_dollar_is_refused(tmp_path, monkeypatch):
+    # The command runs without a shell, so $UID would reach launchctl literally.
+    bot = _bot()
+    state = _hibernating(tmp_path)
+    monkeypatch.setenv("LOBSTER_WAKE_CMD", "launchctl kickstart -k gui/$UID/com.lobster.claude")
+    run = MagicMock(return_value=MagicMock(returncode=0, stderr=""))
+    with patch.object(bot, "LOBSTER_STATE_FILE", state), \
+         patch.object(bot, "_is_claude_running", return_value=False), \
+         patch.object(bot.subprocess, "run", run), \
+         patch.object(bot.log, "error") as err:
+        bot.wake_claude_if_hibernating()
+    assert run.call_args_list == []
+    assert err.called and "$" in err.call_args.args[0]
