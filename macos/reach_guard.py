@@ -21,7 +21,18 @@ Claude Code calls this before every tool use. In order (non-Bash tools):
   3. anything inside ~/lobster-workspace is allowed outright, and (for the
      read-only tools Read/Glob/Grep) anything strictly inside a ~/messages
      subfolder other than inbox/config
+  3b. (final fix wave) the read-only tools Read/Glob/Grep may also read
+      ~/lobster -- Lobster's own CLAUDE.md and bootup files -- except its
+      config/ and .git/ folders, which still need a grant
+  4w. (final fix wave) a write tool (Write/Edit/MultiEdit/NotebookEdit)
+      outside the workspace can only ever be granted strictly inside
+      ~/Documents, ~/Desktop or ~/Downloads; anywhere else is "never
+      allowed" -- Lobster's code/settings/venv, ~/Library, shell rc files,
+      ~/.claude, Homebrew and the like can't be rewritten with one "Yes"
   4. otherwise, only a matching one-shot approval lets it through
+
+~/messages/outbox and ~/messages/sent are hard-denied alongside inbox/config:
+they carry ask_melissa's pending approval ids.
 
 Bash (fix round 3, literal-only policy): denied outright, reason "never
 allowed: command must be literal", if the command contains any of
@@ -87,6 +98,11 @@ HARD_DENIED_RELATIVE = (
     ".local/state/clawdaddy",
     "messages/inbox",
     "messages/config",
+    # Final fix wave (I3): outbox/ and sent/ hold ask_melissa's pending
+    # approval ids in their button callback_data; an agent that could read
+    # one could send its own "approve:<id>" button.
+    "messages/outbox",
+    "messages/sent",
 )
 
 # Case-insensitive glob, matched component by component against the path
@@ -99,7 +115,7 @@ HARD_DENIED_GLOB_RELATIVE = (
 # argument rather than to `home` -- covers a custom LOBSTER_MESSAGES
 # location, and a symlinked one, neither of which the home-relative entries
 # above can see.
-MESSAGES_HARD_DENIED_SUBFOLDERS = ("inbox", "config")
+MESSAGES_HARD_DENIED_SUBFOLDERS = ("inbox", "config", "outbox", "sent")
 
 # <workspace>/.claude, relative to the `workspace` argument. Claude Code
 # loads <cwd>/.claude/settings*.json on start, so a write there could turn
@@ -129,8 +145,19 @@ PATTERN_KEYS = {"Glob": "pattern", "Grep": "glob"}
 NO_PATH_TOOLS = ("WebFetch", "WebSearch", "mcp__lobster-inbox__fetch_page")
 
 # Read-only tools may also read (not write) anywhere under ~/messages other
-# than its hard-denied inbox/config subfolders.
+# than its hard-denied subfolders, and (final fix wave, C3) anywhere under
+# ~/lobster other than config/ and .git/ -- the dispatcher's own
+# instructions (CLAUDE.md, .claude/sys.dispatcher.bootup.md) live there.
 MESSAGES_EXEMPT_TOOLS = ("Read", "Glob", "Grep")
+LOBSTER_READ_EXCLUDED = ("config", ".git")
+
+# Final fix wave (C2): a write tool outside the workspace can be granted
+# only strictly inside one of these home folders. Anywhere else (Lobster's
+# own code and settings, ~/Library, shell rc files, ~/.claude, Homebrew...)
+# is never allowed, so one careless "Yes" can't rewrite what confines the
+# agent or what runs as Melissa at login.
+WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+WRITE_GRANTABLE_RELATIVE = ("Documents", "Desktop", "Downloads")
 
 # Tools that can recurse into a directory tree: a hard-denied location lying
 # anywhere under their target is denied outright (rule 6), and a missing
@@ -476,7 +503,24 @@ def _inside_messages_readable(resolved: Path, messages: Path) -> bool:
     rel_parts = _relative_parts_casefold(resolved, messages)
     if not rel_parts:  # None (not inside) or () (== messages itself)
         return False
-    return rel_parts[0].casefold() not in ("inbox", "config")
+    return rel_parts[0].casefold() not in MESSAGES_HARD_DENIED_SUBFOLDERS
+
+
+def _inside_lobster_readable(resolved: Path, home: Path) -> bool:
+    """True for a path strictly inside ~/lobster, other than config/ and
+    .git/ (which keep needing a grant; config/config.env stays hard-denied)."""
+    rel_parts = _relative_parts_casefold(resolved, home / "lobster")
+    if not rel_parts:
+        return False
+    return rel_parts[0].casefold() not in LOBSTER_READ_EXCLUDED
+
+
+def _write_grantable(resolved: Path, home: Path) -> bool:
+    """True only strictly inside ~/Documents, ~/Desktop or ~/Downloads."""
+    rel_parts = _relative_parts_casefold(resolved, home)
+    if not rel_parts or len(rel_parts) < 2:
+        return False
+    return rel_parts[0].casefold() in (x.casefold() for x in WRITE_GRANTABLE_RELATIVE)
 
 
 def _is_hard_denied(resolved: Path, home: Path, workspace: Path, messages: Path) -> bool:
@@ -491,7 +535,7 @@ def _is_hard_denied(resolved: Path, home: Path, workspace: Path, messages: Path)
     # inbox/config are hard-denied relative to the `messages` argument too,
     # not only when messages happens to live at home/"messages".
     messages_rel = _relative_parts_casefold(resolved, messages)
-    if messages_rel and messages_rel[0].casefold() in ("inbox", "config"):
+    if messages_rel and messages_rel[0].casefold() in MESSAGES_HARD_DENIED_SUBFOLDERS:
         return True
 
     workspace_rel = _relative_parts_casefold(resolved, workspace)
@@ -650,16 +694,48 @@ def decide(
         r
         for r in resolved_paths
         if not _inside_casefold(r, workspace)
-        and not (messages_exempt and _inside_messages_readable(r, messages))
+        and not (
+            messages_exempt
+            and (_inside_messages_readable(r, messages) or _inside_lobster_readable(r, home))
+        )
     ]
     if not outside:
         return "allow", "inside your folder"
+
+    # Final fix wave (C2): outside the workspace, a write tool is grant-able
+    # only under ~/Documents, ~/Desktop, ~/Downloads.
+    if tool_name in WRITE_TOOLS and not all(_write_grantable(r, home) for r in outside):
+        return "deny", DENY_NEVER_ALLOWED
 
     # Rule 4: otherwise, only a one-shot approval gets it through.
     k = approvals.key(tool_name, tool_input)
     if approvals.consume(k, approvals_path, now):
         return "allow", "one-shot approval consumed"
     return "deny", DENY_NEEDS_APPROVAL
+
+
+def never_allowed_reason(
+    tool_name: str,
+    tool_input: dict,
+    home: Path,
+    workspace: Path,
+    cwd: "str | Path | None" = None,
+    messages: "str | Path | None" = None,
+) -> "str | None":
+    """The reason `decide` would refuse this call even with a fresh one-shot
+    grant for it, or None if a grant would let it through. Used by
+    ask_melissa (M5) to refuse up front instead of texting Melissa a request
+    that could never take effect. Judged against a throwaway approvals file,
+    so no real grant is ever written."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="reach-guard-probe-") as tmp:
+        probe = Path(tmp) / "approvals.json"
+        approvals.grant(approvals.key(tool_name, tool_input), probe)
+        decision, reason = decide(
+            tool_name, tool_input, home, workspace, probe, time.time(), cwd=cwd, messages=messages
+        )
+    return reason if decision == "deny" else None
 
 
 def main() -> None:

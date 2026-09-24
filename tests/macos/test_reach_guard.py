@@ -66,8 +66,8 @@ def test_agent_cannot_forge_approval_or_messages(env, tool, p):
 
 def test_messages_readable(env):
     home, _, _ = env
-    (home / "messages" / "sent").mkdir()
-    assert d(env, "Read", {"file_path": str(home / "messages/sent/a.json")}) == "allow"
+    (home / "messages" / "processed").mkdir()
+    assert d(env, "Read", {"file_path": str(home / "messages/processed/a.json")}) == "allow"
 
 def test_own_mcp_tools_allowed(env):
     assert d(env, "mcp__lobster-inbox__send_reply", {"chat_id": 1, "text": "hi"}) == "allow"
@@ -373,11 +373,11 @@ def test_messages_param_is_honored(tmp_path):
     ws = home / "lobster-workspace"
     ws.mkdir(parents=True)
     custom_messages = tmp_path / "elsewhere-messages"
-    (custom_messages / "sent").mkdir(parents=True)
+    (custom_messages / "processed").mkdir(parents=True)
     ap = home / "messages" / "config-approvals.json"
     decision, _ = reach_guard.decide(
         "Read",
-        {"file_path": str(custom_messages / "sent" / "a.json")},
+        {"file_path": str(custom_messages / "processed" / "a.json")},
         home,
         ws,
         ap,
@@ -722,3 +722,134 @@ def test_workspace_root_still_searchable(env):
     assert d(env, "Grep", {"pattern": "x"}) == "allow"
     assert d(env, "Glob", {"pattern": "**/*.md"}) == "allow"
     assert d(env, "Write", {"file_path": str(ws / "claude-notes.md")}) == "allow"
+
+
+# ---------------------------------------------------------------------------
+# Final fix wave
+# ---------------------------------------------------------------------------
+
+def _never(env, tool, inp, **kw):
+    home, ws, ap = env
+    approvals.grant(approvals.key(tool, inp), ap)
+    return reach_guard.decide(tool, inp, home, ws, ap, time.time(), **kw)
+
+
+# C2: a write tool outside the workspace is grant-able only under
+# ~/Documents, ~/Desktop, ~/Downloads; everywhere else is never allowed.
+@pytest.mark.parametrize("p", [
+    "lobster/macos/reach_guard.py", "lobster/macos/claude-settings.json", "lobster/.venv/bin/python",
+    "Library/LaunchAgents/com.evil.plist", ".zshrc", ".zprofile", ".bash_profile", ".profile",
+    ".claude/settings.json", ".config/fish/config.fish", ".gitconfig", ".local/bin/claude",
+    "messages/processed/x.json", "some-folder/x.txt",
+])
+@pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit"])
+def test_write_tools_outside_safe_folders_never_allowed(env, tool, p):
+    home, _, _ = env
+    key = "notebook_path" if tool == "NotebookEdit" else "file_path"
+    inp = {key: str(home / p)}
+    assert _never(env, tool, inp) == ("deny", reach_guard.DENY_NEVER_ALLOWED)
+
+
+@pytest.mark.parametrize("p", ["/opt/homebrew/bin/bash", "/usr/local/bin/x", "/etc/hosts", "/tmp/x"])
+def test_write_tools_outside_home_never_allowed(env, p):
+    assert _never(env, "Write", {"file_path": p, "content": "x"}) == ("deny", reach_guard.DENY_NEVER_ALLOWED)
+
+
+@pytest.mark.parametrize("p", ["Documents/notes.md", "Desktop/a.txt", "Downloads/b/c.txt", "documents/x.md"])
+def test_write_tools_in_safe_folders_allowed_once_with_grant(env, p):
+    home, _, ap = env
+    inp = {"file_path": str(home / p), "content": "x"}
+    assert d(env, "Write", inp) == "deny"
+    approvals.grant(approvals.key("Write", inp), ap)
+    assert d(env, "Write", inp) == "allow"
+    assert d(env, "Write", inp) == "deny"
+
+
+def test_write_to_safe_folder_itself_never_allowed(env):
+    home, _, _ = env
+    assert _never(env, "Write", {"file_path": str(home / "Documents")})[1] == reach_guard.DENY_NEVER_ALLOWED
+
+
+def test_write_via_symlink_in_documents_to_rc_file_never_allowed(env):
+    home, _, _ = env
+    (home / "Documents").mkdir()
+    (home / ".zshrc").write_text("")
+    (home / "Documents" / "rc").symlink_to(home / ".zshrc")
+    assert _never(env, "Write", {"file_path": str(home / "Documents" / "rc")})[1] == reach_guard.DENY_NEVER_ALLOWED
+
+
+# C3: Read/Glob/Grep may read ~/lobster (except config/ and .git/) without a grant.
+@pytest.mark.parametrize("tool,inp", [
+    ("Read", {"file_path": "~/lobster/CLAUDE.md"}),
+    ("Read", {"file_path": "~/lobster/.claude/sys.dispatcher.bootup.md"}),
+    ("Grep", {"pattern": "x", "path": "~/lobster/src"}),
+    ("Glob", {"pattern": "*.md", "path": "~/lobster/.claude"}),
+])
+def test_lobster_repo_readable_without_grant(env, tool, inp):
+    assert d(env, tool, inp) == "allow"
+
+
+@pytest.mark.parametrize("p", ["~/lobster/config/owner.toml", "~/lobster/.git/config", "~/lobster/.GIT/config"])
+def test_lobster_config_and_git_still_need_grant(env, p):
+    assert d(env, "Read", {"file_path": p}) == "deny"
+
+
+def test_lobster_repo_not_writable(env):
+    assert _never(env, "Edit", {"file_path": "~/lobster/CLAUDE.md"})[1] == reach_guard.DENY_NEVER_ALLOWED
+
+
+# I3: the agent must not learn pending approval ids from outbox/ or sent/.
+@pytest.mark.parametrize("tool,p", [
+    ("Read", "messages/sent/1_approval.json"), ("Read", "messages/outbox/1_approval.json"),
+    ("Grep", "messages/sent"), ("Glob", "messages/outbox"), ("Read", "messages/SENT/x.json"),
+])
+def test_outbox_and_sent_hard_denied(env, tool, p):
+    home, _, _ = env
+    key = "file_path" if tool == "Read" else "path"
+    inp = {key: str(home / p)}
+    if tool != "Read":
+        inp["pattern"] = "approve"
+    assert _never(env, tool, inp)[1] == reach_guard.DENY_NEVER_ALLOWED
+
+
+@pytest.mark.parametrize("cmd", ["cat {home}/messages/sent/1_approval.json", "ls {home}/messages/outbox"])
+def test_bash_outbox_and_sent_hard_denied(env, cmd):
+    home, _, _ = env
+    assert _never(env, "Bash", {"command": cmd.format(home=home)})[1] == reach_guard.DENY_NEVER_ALLOWED
+
+
+def test_messages_other_subfolders_still_readable(env):
+    home, _, _ = env
+    assert d(env, "Read", {"file_path": str(home / "messages/processed/a.json")}) == "allow"
+
+
+# I2: a Bash grant is keyed on the command alone.
+def test_bash_grant_ignores_description_and_timeout(env):
+    home, _, ap = env
+    approvals.grant(approvals.key("Bash", {"command": "ls notes", "description": "list notes"}), ap)
+    assert d(env, "Bash", {"command": "ls notes", "description": "List the notes", "timeout": 5000}) == "allow"
+
+
+def test_bash_grant_still_bound_to_command(env):
+    home, _, ap = env
+    approvals.grant(approvals.key("Bash", {"command": "ls notes"}), ap)
+    assert d(env, "Bash", {"command": "ls drafts"}) == "deny"
+
+
+def test_non_bash_key_still_covers_whole_input():
+    a = approvals.key("Write", {"file_path": "/x", "content": "a"})
+    b = approvals.key("Write", {"file_path": "/x", "content": "b"})
+    assert a != b
+
+
+# M5: a helper that says, without texting anyone, whether a grant could ever help.
+def test_never_allowed_reason(env):
+    home, ws, _ = env
+    na = lambda tool, inp: reach_guard.never_allowed_reason(tool, inp, home, ws)
+    assert na("Write", {"file_path": str(home / ".zshrc")}) == reach_guard.DENY_NEVER_ALLOWED
+    assert na("Read", {"file_path": str(home / ".ssh/id_ed25519")}) == reach_guard.DENY_NEVER_ALLOWED
+    assert na("Bash", {"command": "cat *.md"}) == reach_guard.DENY_BASH_MUST_BE_LITERAL
+    assert na("Frobnicate", {}) == reach_guard.DENY_TOOL_NOT_PERMITTED
+    assert na("Read", {"file_path": str(home / "Documents/x.md")}) is None
+    assert na("Write", {"file_path": str(home / "Documents/x.md")}) is None
+    assert na("Bash", {"command": "ls notes"}) is None

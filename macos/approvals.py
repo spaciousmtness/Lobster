@@ -37,7 +37,13 @@ DEFAULT_PATH = Path.home() / ".local" / "state" / "clawdaddy" / "approvals.json"
 
 
 def key(tool_name: str, tool_input: dict) -> str:
-    """Canonical key for one tool call: sha256(tool_name + "\\n" + sorted json)."""
+    """Canonical key for one tool call: sha256(tool_name + "\\n" + sorted json).
+
+    Bash is keyed on its command alone: Claude Code fills in `description`
+    and `timeout` itself and they vary between the ask and the retry, while
+    neither changes what runs."""
+    if tool_name == "Bash" and isinstance(tool_input, dict):
+        tool_input = {"command": tool_input.get("command", "")}
     canonical = tool_name + "\n" + json.dumps(tool_input, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
