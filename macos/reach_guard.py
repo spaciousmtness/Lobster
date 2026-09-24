@@ -3,16 +3,18 @@
 
 Claude Code calls this before every tool use. In order (non-Bash tools):
   0. an unlisted tool is refused outright ("tool not permitted")
-  C3. a `..` component anywhere in a Glob pattern or Grep glob denies
-      outright, grant or no grant
+  C3/I5. a `..` component, or a `{...}` brace group containing "/" or "~",
+      anywhere in a Glob pattern or Grep glob denies outright, grant or no
+      grant
   1. a hard-denied location is denied no matter what, grant or no grant
      ("never allowed") -- checked against `home` AND against the `messages`
      argument (inbox/config under either)
   6. for a recursive tool (Grep/Glob/LS), a target that merely CONTAINS a
-     hard-denied location (including ~/messages, an ancestor of its own
-     inbox/config) is denied too -- a grant on a parent can't authorize
-     walking into the secret underneath it. A missing "path" is judged as
-     if it were the resolved cwd.
+     hard-denied location (relative to home OR relative to messages -- so
+     ~/messages itself, or a custom/symlinked messages root, is covered
+     too) is denied too -- a grant on a parent can't authorize walking into
+     the secret underneath it. A missing "path" is judged as if it were the
+     resolved cwd.
   2. tools with no path of their own (WebFetch, WebSearch, the inbox
      page-fetcher) always need a fresh grant
   5. Lobster's own MCP tools are always allowed
@@ -21,11 +23,17 @@ Claude Code calls this before every tool use. In order (non-Bash tools):
      subfolder other than inbox/config
   4. otherwise, only a matching one-shot approval lets it through
 
-Bash: every call needs a one-shot grant for that exact call -- there is no
-auto-allow path. A hard-denied location named anywhere in the command text
-still denies outright, even with a grant; the match is robust against
-shell quoting tricks (`.s''sh` -> `.ssh`) and glob wildcards (`.ss?`
-matching `.ssh`) used to break a sensitive name up.
+Bash (fix round 3, literal-only policy): denied outright, reason "never
+allowed: command must be literal", if the command contains any of
+`* ? [ { $ \\` ' "`, a ".." path component, the word cd/pushd/popd, or if
+the stdin cwd doesn't resolve inside the workspace -- no exceptions, no
+grant helps. Otherwise the command is literal: every whitespace/operator-
+split token is resolved as a path (relative ones against cwd, a leading
+"~" against home) and judged with the same hard-deny check a file tool's
+path argument gets; any hit denies outright, no hits falls to the ordinary
+one-shot grant. There is no wildcard/quoting obfuscation scan any more --
+banning the characters that make one possible is simpler and cheaper than
+trying to out-guess them.
 
 Every relative path argument (and a Glob/Grep pattern's fixed base) resolves
 against the stdin `cwd`, not the workspace -- a Bash-adjacent tool call
@@ -84,6 +92,12 @@ HARD_DENIED_GLOB_RELATIVE = (
     "Library/Group Containers/*1password*",
 )
 
+# messages/inbox and messages/config, but relative to the `messages`
+# argument rather than to `home` -- covers a custom LOBSTER_MESSAGES
+# location, and a symlinked one, neither of which the home-relative entries
+# above can see.
+MESSAGES_HARD_DENIED_SUBFOLDERS = ("inbox", "config")
+
 # Outside the workspace, a file whose name merely looks like a secret is
 # treated as one -- catches stray credential files hard-denial didn't
 # anticipate by exact location. Checked against every path component, not
@@ -135,108 +149,76 @@ KNOWN_TOOLS = frozenset(
 
 DENY_TOOL_NOT_PERMITTED = "tool not permitted"
 DENY_NEVER_ALLOWED = "never allowed"
+DENY_BASH_MUST_BE_LITERAL = "never allowed: command must be literal"
 DENY_NEEDS_APPROVAL = (
     "Outside your folder. Call ask_melissa with what you want to do and why, "
     "then retry the exact same call."
 )
 
 # ---------------------------------------------------------------------------
-# Bash: every call needs its own one-shot grant. There is no auto-allow
-# path -- the only question left is whether the command names a hard-denied
-# location, which loses even with a grant.
+# Bash (fix round 3): literal-only policy. No wildcard/quote scanning -- a
+# command containing any character or word that could hide or construct a
+# path is refused outright, so the only commands that ever reach path
+# resolution are ones where "the tokens are exactly what they look like" is
+# actually true.
 # ---------------------------------------------------------------------------
 
-# Signatures checked against the normalized command string -- catches a
-# hard-denied location however it's written (absolute, "~/" form, "$HOME/"
-# form, or bare home-relative name), since all four forms contain the same
-# distinctive substring.
-_BASH_HARD_DENIED_SIGNATURES = tuple(
-    sorted({e.casefold() for e in HARD_DENIED_RELATIVE} | {"lobster/config", "1password"})
-)
+_BASH_BANNED_CHARS = frozenset("*?[{$`\\'\"")
+_BASH_BANNED_WORDS = frozenset({"cd", "pushd", "popd"})
 
-# Characters bash quoting can use to split a sensitive name up without
-# changing what the shell actually sees (`.s''sh` -> `.ssh`).
-_BASH_QUOTE_CHARS = ("'", '"')
+# Tokenizing splits on whitespace and these operators -- NOT on "/", so a
+# path's internal structure survives intact in one token.
+_BASH_SPLIT_RE = re.compile(r"[\s;&|<>()=,]+")
 
-# A brace group has no native fnmatch equivalent; coarsening it to a single
-# wildcard is the safe (over-inclusive, i.e. more likely to deny) direction.
-_BASH_BRACE_RE = re.compile(r"\{[^{}]*\}")
-
-_BASH_WILDCARD_CHARS = "*?["
-
-# Cap on the windowed wildcard scan below, purely to bound worst-case work
-# for a pathologically long command; the plain substring check (which
-# catches the large majority of real attempts, quoting tricks included)
-# still runs regardless of length. The scan only considers windows whose
-# length is close to the signature's own length (a small amount of slack
-# either way, for a `*`/`{...}` swallowing or contributing a couple of
-# characters) -- a short fragment like "*.json" must NOT be allowed to
-# match a long signature like ".claude/.credentials.json" just because it
-# happens to share a generic trailing extension.
-_BASH_SCAN_MAX_LEN = 600
-_BASH_SCAN_SLACK_SHORTER = 2
-_BASH_SCAN_SLACK_LONGER = 3
+# Only used to detect a ".." *component*: splits on "/" too, so
+# "../.ssh" or "foo/../bar" actually isolates the ".." between slashes.
+_BASH_COMPONENT_SPLIT_RE = re.compile(r"[\s;&|<>()=,/]+")
 
 
-def _bash_normalize(command: str) -> str:
-    """Strip characters bash quoting/escaping could use to split up a
-    sensitive name, then casefold."""
-    normalized = command
-    for ch in _BASH_QUOTE_CHARS:
-        normalized = normalized.replace(ch, "")
-    normalized = normalized.replace("\\", "")
-    return normalized.casefold()
+def _bash_has_banned_chars(command: str) -> bool:
+    return any(c in _BASH_BANNED_CHARS for c in command)
 
 
-def _bash_could_name(normalized: str, signature: str) -> bool:
-    """True if `signature` appears literally in `normalized`, or could be
-    produced by some window of it once ?, *, [...] and {...} are treated as
-    shell wildcards standing in for characters of `signature`."""
-    if signature in normalized:
-        return True
-
-    candidate = _BASH_BRACE_RE.sub("*", normalized)
-    if signature in candidate:
-        return True
-    if not any(c in candidate for c in _BASH_WILDCARD_CHARS):
-        return False
-    if len(candidate) > _BASH_SCAN_MAX_LEN:
-        return False
-
-    sig_len = len(signature)
-    n = len(candidate)
-    min_len = max(1, sig_len - _BASH_SCAN_SLACK_SHORTER)
-    max_len = sig_len + _BASH_SCAN_SLACK_LONGER
-    if n < min_len:
-        return False  # too short to contain a window of sufficient length at all
-    for start in range(0, n - min_len + 1):
-        max_end = min(n, start + max_len)
-        for end in range(start + min_len, max_end + 1):
-            window = candidate[start:end]
-            has_wildcard = any(c in window for c in _BASH_WILDCARD_CHARS)
-            has_literal = any(c not in _BASH_WILDCARD_CHARS for c in window)
-            # A window with no literal characters at all (e.g. a bare "*")
-            # is *, and fnmatch(anything, "*") is trivially True -- that's
-            # not evidence the command names anything in particular, so it
-            # doesn't count as a match on its own. Nor does a short generic
-            # fragment (like "*.json") whose length is far below the whole
-            # signature's -- the length bounds above already exclude it.
-            if not (has_wildcard and has_literal):
-                continue
-            if fnmatch.fnmatch(signature, window):
-                return True
-    return False
+def _bash_has_dotdot(command: str) -> bool:
+    return any(part == ".." for part in _BASH_COMPONENT_SPLIT_RE.split(command))
 
 
-def _bash_hard_denied(command: str) -> bool:
-    normalized = _bash_normalize(command)
-    return any(_bash_could_name(normalized, sig) for sig in _BASH_HARD_DENIED_SIGNATURES)
+def _bash_has_banned_word(command: str) -> bool:
+    words = _BASH_SPLIT_RE.split(command)
+    return any(w in _BASH_BANNED_WORDS for w in words if w)
 
 
-def _decide_bash(tool_input: dict, approvals_path: Path, now: float) -> tuple[str, str]:
+def _bash_must_be_literal_violation(command: str) -> bool:
+    return (
+        _bash_has_banned_chars(command)
+        or _bash_has_dotdot(command)
+        or _bash_has_banned_word(command)
+    )
+
+
+def _bash_tokenize(command: str) -> list[str]:
+    return [t for t in _BASH_SPLIT_RE.split(command) if t]
+
+
+def _decide_bash(
+    tool_input: dict,
+    home: Path,
+    workspace: Path,
+    resolved_cwd: Path,
+    messages: Path,
+    approvals_path: Path,
+    now: float,
+) -> tuple[str, str]:
     command = tool_input.get("command", "") or ""
-    if _bash_hard_denied(command):
-        return "deny", DENY_NEVER_ALLOWED
+
+    if not _inside_casefold(resolved_cwd, workspace) or _bash_must_be_literal_violation(command):
+        return "deny", DENY_BASH_MUST_BE_LITERAL
+
+    for token in _bash_tokenize(command):
+        resolved = _resolve(token, resolved_cwd, home)
+        if _is_hard_denied(resolved, home, workspace, messages):
+            return "deny", DENY_NEVER_ALLOWED
+
     k = approvals.key("Bash", tool_input)
     if approvals.consume(k, approvals_path, now):
         return "allow", "one-shot approval consumed"
@@ -291,9 +273,12 @@ def _pattern_fixed_prefix(pattern: str) -> str:
     character rather than mid-segment, so a partial name like ".S" cut out
     of ".S*/*" can never be mistaken for a safe, fully-specified path
     component -- the boundary lands on the last directory we can actually
-    be sure of."""
+    be sure of. "{" counts as a wildcard here too: a pattern that opens a
+    brace group in its very first segment (e.g. "{<home>/.ssh,x}/*") has no
+    fixed prefix at all, which is why `_pattern_has_risky_brace` below is a
+    separate, independent check rather than relying on this cut alone."""
     cut = len(pattern)
-    for ch in ("*", "?", "["):
+    for ch in ("*", "?", "[", "{"):
         pos = pattern.find(ch)
         if pos != -1 and pos < cut:
             cut = pos
@@ -307,6 +292,20 @@ def _pattern_fixed_prefix(pattern: str) -> str:
 
 def _pattern_has_dotdot(pattern: str) -> bool:
     return any(part == ".." for part in pattern.split("/"))
+
+
+_PATTERN_BRACE_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def _pattern_has_risky_brace(pattern: str) -> bool:
+    """True if any `{...}` brace group in the pattern contains "/" or "~" --
+    e.g. `{<home>/.ssh,x}/*` -- which can smuggle an absolute or home-
+    relative path in where the fixed-prefix cut can't see it (a brace
+    group at the very start leaves no fixed prefix at all)."""
+    return any(
+        "/" in group.group(1) or "~" in group.group(1)
+        for group in _PATTERN_BRACE_RE.finditer(pattern)
+    )
 
 
 def _gather_raw_paths(tool_input: dict) -> list[str]:
@@ -417,11 +416,11 @@ def _is_hard_denied(resolved: Path, home: Path, workspace: Path, messages: Path)
 
 
 def _is_ancestor_of_denied(target: Path, home: Path) -> bool:
-    """True if a hard-denied location lies at or under `target` -- i.e.
-    `target` is an ancestor of (or equal to) it. Used to stop a recursive
-    tool from being granted a broad target that quietly contains a secret
-    -- this includes ~/messages itself, since messages/inbox and
-    messages/config sit under it."""
+    """True if a hard-denied location (relative to `home`) lies at or under
+    `target` -- i.e. `target` is an ancestor of (or equal to) it. Used to
+    stop a recursive tool from being granted a broad target that quietly
+    contains a secret -- this includes ~/messages itself, since
+    messages/inbox and messages/config sit under it."""
     rel_parts = _relative_parts_casefold(target, home)
     if rel_parts is None:
         # target isn't under home; the only way it's still an ancestor of
@@ -443,6 +442,27 @@ def _is_ancestor_of_denied(target: Path, home: Path) -> bool:
         ):
             return True
 
+    return False
+
+
+def _is_ancestor_of_messages_denied(target: Path, messages: Path) -> bool:
+    """True if `target` is at or above `<messages>/inbox` or
+    `<messages>/config` -- the `messages`-relative counterpart of
+    `_is_ancestor_of_denied`. Needed separately because `messages` can live
+    outside `home` entirely (a custom LOBSTER_MESSAGES) or reach its real
+    location through a symlink (~/messages -> elsewhere) -- either way
+    `messages` itself was already `.resolve()`d at the top of `decide()`,
+    so this only has to compare against it directly."""
+    rel_parts = _relative_parts_casefold(target, messages)
+    if rel_parts is None:
+        # target isn't under messages; still an ancestor of both subfolders
+        # if messages itself sits under target.
+        return _inside_casefold(messages, target)
+    depth = len(rel_parts)
+    if depth == 0:
+        return True  # target IS messages -- both subfolders sit right under it
+    if depth == 1 and rel_parts[0].casefold() in MESSAGES_HARD_DENIED_SUBFOLDERS:
+        return True
     return False
 
 
@@ -469,10 +489,10 @@ def decide(
     if not _tool_allowed(tool_name):
         return "deny", DENY_TOOL_NOT_PERMITTED
 
-    if tool_name == "Bash":
-        return _decide_bash(tool_input, approvals_path, now)
-
     resolved_cwd = _resolve(str(cwd), workspace, home) if cwd is not None else workspace
+
+    if tool_name == "Bash":
+        return _decide_bash(tool_input, home, workspace, resolved_cwd, messages, approvals_path, now)
 
     raw_paths = _gather_raw_paths(tool_input)
     resolved_paths = [_resolve(p, resolved_cwd, home) for p in raw_paths]
@@ -483,12 +503,15 @@ def decide(
     if tool_name in RECURSIVE_TOOLS and not tool_input.get("path"):
         resolved_paths.append(resolved_cwd)
 
-    # Rule (C3): a ".." component in a Glob pattern or Grep glob is denied
+    # Rule (C3/I5): a ".." component, or a "{...}" brace group smuggling a
+    # "/" or "~" inside it, in a Glob pattern or Grep glob is denied
     # outright, grant or no grant -- resolution alone isn't trusted here.
     pattern_field = PATTERN_KEYS.get(tool_name)
     if pattern_field:
         raw_pattern = tool_input.get(pattern_field)
-        if isinstance(raw_pattern, str) and _pattern_has_dotdot(raw_pattern):
+        if isinstance(raw_pattern, str) and (
+            _pattern_has_dotdot(raw_pattern) or _pattern_has_risky_brace(raw_pattern)
+        ):
             return "deny", DENY_NEVER_ALLOWED
 
     # Rule 1: hard-denied locations always lose, grant or no grant.
@@ -497,8 +520,11 @@ def decide(
 
     # Rule 6: a recursive tool whose target contains a hard-denied location
     # is denied too -- a grant on the parent can't unlock what's under it.
+    # Checked relative to home AND relative to messages (a custom or
+    # symlinked messages root has no useful home-relative representation).
     if tool_name in RECURSIVE_TOOLS and any(
-        _is_ancestor_of_denied(r, home) for r in resolved_paths
+        _is_ancestor_of_denied(r, home) or _is_ancestor_of_messages_denied(r, messages)
+        for r in resolved_paths
     ):
         return "deny", DENY_NEVER_ALLOWED
 
