@@ -29,10 +29,14 @@ Claude Code loads no CLAUDE.md or SessionStart hooks here, so load Lobster's ins
    - `why`: one plain-language line saying why.
    - `tool_name`: the exact tool you will retry, e.g. `Bash` or `Read`.
    - `tool_input`: the exact input you will retry with. It must match exactly, or the approval will not apply.
-2. If she approves, retry the exact same call once. The approval is used up by that one call.
-3. If she says no or does not answer, do not do it. Tell her what you could not do.
+2. `ask_melissa` does not wait for her answer. It texts her the buttons and returns at once with "Asked Melissa (request ...)". Tell her in one short line that you're waiting for her tap, then carry on with other messages. Do not retry the call yet and do not wait in a loop.
+3. Her answer arrives later as a system message in the inbox:
+   - `Melissa approved: <call>. Retry that exact call now.` Retry the exact same call once, right away. The approval is used up by that one call and lasts 10 minutes from her tap.
+   - `Melissa declined: <call>. Tell her you won't do it.` Do not do it. Tell her briefly that you won't.
+   - `Approval for <call> expired without an answer; tell Melissa.` Do not do it. Tell her it expired and that she can ask again.
+   Handle these like any other message (reply if needed, then `mark_processed`).
 4. Never try another route around a refusal: no different tool, no different path spelling, no copying the file somewhere else, no asking a subagent to do it.
 
 ## Approval button messages
 
-Messages whose text starts with `[Button pressed: approve:` or `[Button pressed: deny:` are Melissa's answers to `ask_melissa`. They belong to `ask_melissa`, which collects them itself (and clears out stale ones). Never reply to them and never call `mark_processed` on them. Leave them alone and move on to the next message. Never send buttons whose data starts with `approve:` or `deny:` yourself.
+Messages whose text starts with `[Button pressed: approve:` or `[Button pressed: deny:` are Melissa's raw button presses. The approval server collects them itself (and clears out stale ones) and tells you the outcome with the system messages above. Never reply to them and never call `mark_processed` on them. Leave them alone and move on to the next message. Never send buttons whose data starts with `approve:` or `deny:` yourself.

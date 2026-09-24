@@ -2,12 +2,16 @@
 """ask_melissa: the MCP server the agent calls when the reach guard refuses.
 
 When `reach_guard.py` denies a tool call for lacking a one-shot approval, the
-agent is told to call `ask_melissa` with what it wants to do and why, then
-retry the exact same call. This server is that tool: it texts Melissa a
-Yes/No button through Lobster's outbox, blocks until she presses one (or the
-timeout expires), and on "approved" records a one-shot grant in the same
-`~/.local/state/clawdaddy/approvals.json` file the reach guard consumes from
--- so the agent's retry of the exact same call goes through.
+agent is told to call `ask_melissa` with what it wants to do and why. This
+server is that tool: it records the request as pending, texts Melissa a
+Yes/No button through Lobster's outbox, and returns at once -- it never
+waits for her, because a blocked tool call freezes the whole dispatcher
+(Task 7 live finding, 2026-09-24). A sweeper thread in this process watches
+the inbox for her press; on "Yes" it records a one-shot grant in the same
+`~/.local/state/clawdaddy/approvals.json` file the reach guard consumes from,
+and on any outcome (yes, no, or 30 minutes of silence) it drops a source
+"system" inbox message telling the dispatcher, which then retries the exact
+same call (or tells Melissa it won't).
 
 Self-contained on purpose: it follows the same `mcp.server` + stdio pattern
 as `src/mcp/inbox_server.py`, but it does not import from it and it never
@@ -45,11 +49,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-# How long a single ask_melissa call is allowed to block, at most, and how
-# often wait_for_answer re-scans the inbox while waiting.
-MAX_TIMEOUT_SECONDS = 1800
-DEFAULT_TIMEOUT_SECONDS = 1800
-POLL_INTERVAL_SECONDS = 1.0
+# How long a request stays pending before it expires unanswered.
+PENDING_TTL_SECONDS = 1800
 
 # The non-path remainder of a tool call's rendering is truncated to this
 # many chars. The path (or Bash command) itself is never truncated: Melissa
@@ -60,13 +61,15 @@ RENDER_TRUNCATE_CHARS = 300
 PREVIEW_LINES = 5
 PREVIEW_LINE_CHARS = 120
 
-# Pending request ids (id -> deadline epoch), shared by every
-# approval_server process. Lives beside approvals.json, which the agent can
+# Pending requests (id -> {tool_name, tool_input, action, expected_text,
+# chat_id, created, deadline}), shared by every approval_server process and
+# surviving their restarts. Lives beside approvals.json, which the agent can
 # neither read nor write (reach guard hard-deny + sandbox).
 PENDING_PATH = approvals.DEFAULT_PATH.parent / "pending-approvals.json"
 
-# How often the stray-press sweeper runs, after one sweep at startup.
-SWEEP_INTERVAL_SECONDS = 15.0
+# How often the sweeper looks for presses, after one sweep at startup. It is
+# the only thing between Melissa's tap and the dispatcher hearing about it.
+SWEEP_INTERVAL_SECONDS = 1.0
 
 _PRESS_RE = re.compile(r"^\[Button pressed: (approve|deny):([^\]]*)\]$")
 
@@ -159,7 +162,7 @@ def build_request(
     sends it with no changes on its end.
     """
     ts_ms = ts_ms if ts_ms is not None else int(time.time() * 1000)
-    lines = [f"Clawdaddy wants to: {action}", f"Why: {why}"]
+    lines = ["⏳ Needs your tap:", f"Clawdaddy wants to: {action}", f"Why: {why}"]
     if tool_name:
         # A code block: the bot renders Markdown, and underscores in a path
         # would otherwise turn into italics and disappear.
@@ -182,64 +185,17 @@ def build_request(
     }
 
 
-def wait_for_answer(
-    inbox: Path,
-    processed: Path,
-    request_id: str,
-    owner_id: int,
-    deadline: float,
-    poll: float,
-    expected_text: str | None = None,
-) -> str:
-    """Block until Melissa presses Yes/No for `request_id`, or `deadline` passes.
-
-    Scans `inbox` sorted by name, and the sibling `processing/` directory
-    too: the dispatcher is told to leave button presses alone, but it may
-    still have claimed one with `mark_processing` before this function's
-    next poll. Only a button press from `owner_id`, for exactly this
-    `request_id`, is consumed -- everything else (a stranger's press, a
-    press for a different request, an ordinary text message) is left
-    untouched for the dispatcher to handle normally. The matched file is
-    moved into `processed` so it is never seen twice.
-
-    With `expected_text`, a press also has to come from the message this
-    request sent: the bot records the pressed message's text as
-    `original_message_text`, and it must contain `expected_text` (compared
-    whitespace-normalized). A press whose message doesn't match -- a button
-    the agent sent itself with a guessed or leaked id -- is moved to
-    `processed` and ignored.
-    """
-    approve_text = f"[Button pressed: approve:{request_id}]"
-    deny_text = f"[Button pressed: deny:{request_id}]"
-    processing = inbox.parent / "processing"
-
-    while True:
-        for base in (inbox, processing):
-            if not base.is_dir():
-                continue
-            for f in sorted(base.glob("*.json")):
-                try:
-                    msg = json.loads(f.read_text())
-                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("source") != "telegram" or msg.get("user_id") != owner_id:
-                    continue
-                text = msg.get("text")
-                if text not in (approve_text, deny_text):
-                    continue
-                if expected_text is not None and _norm_ws(expected_text) not in _norm_ws(
-                    str(msg.get("original_message_text") or "")
-                ):
-                    _claim(f, processed)
-                    continue
-                _claim(f, processed)
-                return "approved" if text == approve_text else "denied"
-
-        if time.time() >= deadline:
-            return "timed out"
-        time.sleep(poll)
+def _press_is_genuine(msg: dict, owner_id: int | None, expected_text: str | None) -> bool:
+    """A press counts only if it came from `owner_id` on Telegram and from
+    the message this request sent: the bot records the pressed message's
+    text as `original_message_text`, and it must contain `expected_text`
+    (compared whitespace-normalized). A press on a button the agent sent
+    itself with a guessed or leaked id fails this."""
+    if owner_id is None or msg.get("source") != "telegram" or msg.get("user_id") != owner_id:
+        return False
+    if not expected_text:
+        return False
+    return _norm_ws(expected_text) in _norm_ws(str(msg.get("original_message_text") or ""))
 
 
 def _claim(matched: Path, processed: Path) -> None:
@@ -252,10 +208,12 @@ def _claim(matched: Path, processed: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pending ids and the stray-press sweeper (I1). The dispatcher is told never
-# to mark a button press processed, so a press nobody is waiting for (late,
-# duplicate, or for a request that already timed out) would sit in the inbox
-# forever and make wait_for_messages return at once, every time.
+# Pending requests and the sweeper. The sweeper answers presses for pending
+# requests, expires the ones nobody answered, and clears every other
+# approve:/deny: press: the dispatcher is told never to mark a button press
+# processed, so a press nobody is waiting for (late, duplicate, forged, or
+# for an expired request) would otherwise sit in the inbox forever and make
+# wait_for_messages return at once, every time.
 # ---------------------------------------------------------------------------
 
 
@@ -278,11 +236,48 @@ def _load_pending(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def add_pending(request_id: str, deadline: float, path: Path) -> None:
+def _deadline(entry: Any) -> float | None:
+    """An entry's deadline. Bare numbers are the pre-non-blocking format
+    (id -> deadline) and still read, so an old file is swept, not crashed on."""
+    if isinstance(entry, (int, float)):
+        return float(entry)
+    if isinstance(entry, dict) and isinstance(entry.get("deadline"), (int, float)):
+        return float(entry["deadline"])
+    return None
+
+
+def add_pending(request_id: str, deadline: float, path: Path, record: dict | None = None) -> None:
     with _pending_locked(path):
         data = _load_pending(path)
-        data[request_id] = deadline
+        data[request_id] = {**(record or {}), "deadline": deadline}
         _atomic_write(path, data)
+
+
+def _take_pending(request_id: str, path: Path, now: float) -> dict | None:
+    """Remove and return a live pending request, atomically, so two sweepers
+    (one per approval_server process) can never both answer one press."""
+    with _pending_locked(path):
+        data = _load_pending(path)
+        entry = data.get(request_id)
+        d = _deadline(entry)
+        if not isinstance(entry, dict) or d is None or d < now:
+            return None
+        del data[request_id]
+        _atomic_write(path, data)
+    return entry
+
+
+def _take_expired(path: Path, now: float) -> list[dict]:
+    """Remove and return every pending request past its deadline."""
+    with _pending_locked(path):
+        data = _load_pending(path)
+        expired = {k: v for k, v in data.items() if (_deadline(v) or 0) < now}
+        if not expired:
+            return []
+        for k in expired:
+            del data[k]
+        _atomic_write(path, data)
+    return [v for v in expired.values() if isinstance(v, dict)]
 
 
 def remove_pending(request_id: str, path: Path) -> None:
@@ -295,7 +290,7 @@ def remove_pending(request_id: str, path: Path) -> None:
 def pending_ids(path: Path, now: float) -> set[str]:
     with _pending_locked(path):
         data = _load_pending(path)
-    return {k for k, v in data.items() if isinstance(v, (int, float)) and v >= now}
+    return {k for k, v in data.items() if (d := _deadline(v)) is not None and d >= now}
 
 
 def sweep_stray_presses(inbox: Path, processed: Path, pending_path: Path, now: float) -> int:
@@ -323,10 +318,102 @@ def sweep_stray_presses(inbox: Path, processed: Path, pending_path: Path, now: f
     return moved
 
 
+def _one_line_call(entry: dict) -> str:
+    tool_name = entry.get("tool_name")
+    if tool_name:
+        tool_input = entry.get("tool_input")
+        return _render_call(str(tool_name), tool_input if isinstance(tool_input, dict) else {}).splitlines()[0]
+    return str(entry.get("action") or "an action")
+
+
+def _write_inbox_note(inbox: Path, request_id: str, text: str) -> None:
+    """A source "system" inbox message for the dispatcher: the same shape
+    scripts/daily-update-check.sh and update_manager's inbox note use
+    ("system" is the only source the inbox server's quarantine guard
+    accepts for a system-generated message)."""
+    msg_id = f"{int(time.time() * 1000)}_approval_{request_id}"
+    _atomic_write(inbox / f"{msg_id}.json", {
+        "id": msg_id,
+        "source": "system",
+        "chat_id": 0,
+        "type": "approval_notification",
+        "text": text,
+        "timestamp": datetime.now().astimezone().isoformat(),
+    })
+
+
+def answer_presses(inbox: Path, processed: Path, pending_path: Path, approvals_path: Path,
+                   owner_id: int | None, now: float) -> int:
+    """Act on every approve:/deny: press for a live pending request, in
+    `inbox` and in `processing/` (the dispatcher is told to leave presses
+    alone, but may still have claimed one). A genuine press (the owner's,
+    from the message this request sent) takes the request off the pending
+    list, grants on approve (the grant's TTL starts now, at the tap), and
+    leaves a system inbox note. Any other press for a pending id is moved
+    out of the way and ignored; the request stays pending. Returns how many
+    requests were answered."""
+    live = pending_ids(pending_path, now)
+    if not live:
+        return 0
+    answered = 0
+    for base in (inbox, inbox.parent / "processing"):
+        if not base.is_dir():
+            continue
+        for f in sorted(base.glob("*.json")):
+            try:
+                msg = json.loads(f.read_text())
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(msg, dict):
+                continue
+            m = _PRESS_RE.match(str(msg.get("text") or ""))
+            if not m or m.group(2) not in live:
+                continue
+            verb, request_id = m.groups()
+            with _pending_locked(pending_path):
+                entry = _load_pending(pending_path).get(request_id)
+            expected = entry.get("expected_text") if isinstance(entry, dict) else None
+            if not _press_is_genuine(msg, owner_id, expected):
+                _claim(f, processed)
+                continue
+            entry = _take_pending(request_id, pending_path, now)
+            _claim(f, processed)
+            if entry is None:
+                continue  # another sweeper answered it first
+            call = _one_line_call(entry)
+            if verb == "approve":
+                approvals.grant(approvals.key(str(entry.get("tool_name") or ""), entry.get("tool_input") or {}),
+                                approvals_path)
+                _write_inbox_note(inbox, request_id, f"Melissa approved: {call}. Retry that exact call now.")
+            else:
+                _write_inbox_note(inbox, request_id, f"Melissa declined: {call}. Tell her you won't do it.")
+            live.discard(request_id)
+            answered += 1
+    return answered
+
+
+def expire_pending(inbox: Path, pending_path: Path, now: float) -> int:
+    expired = _take_expired(pending_path, now)
+    for entry in expired:
+        _write_inbox_note(inbox, str(entry.get("id") or "expired"),
+                          f"Approval for {_one_line_call(entry)} expired without an answer; tell Melissa.")
+    return len(expired)
+
+
+def sweep_once(inbox: Path, processed: Path, pending_path: Path, approvals_path: Path,
+               owner_id: int | None, now: float) -> None:
+    """One sweeper pass: answer presses, expire the unanswered, clear strays.
+    Everything it needs is on disk, so a fresh server process picks up
+    requests an earlier one sent."""
+    answer_presses(inbox, processed, pending_path, approvals_path, owner_id, now)
+    expire_pending(inbox, pending_path, now)
+    sweep_stray_presses(inbox, processed, pending_path, now)
+
+
 def _sweep_forever(interval: float) -> None:
     while True:
         try:
-            sweep_stray_presses(INBOX_DIR, PROCESSED_DIR, PENDING_PATH, time.time())
+            sweep_once(INBOX_DIR, PROCESSED_DIR, PENDING_PATH, approvals.DEFAULT_PATH, _owner_id(), time.time())
         except Exception:
             pass  # a failed sweep must never take the approval server down
         time.sleep(interval)
@@ -383,12 +470,6 @@ async def handle_ask_melissa(args: dict[str, Any]) -> list[TextContent]:
     if not isinstance(tool_input, dict):
         tool_input = {"value": tool_input}
 
-    try:
-        timeout_seconds = float(args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
-    except (TypeError, ValueError):
-        timeout_seconds = DEFAULT_TIMEOUT_SECONDS
-    timeout_seconds = max(0.0, min(MAX_TIMEOUT_SECONDS, timeout_seconds))
-
     owner_id = _owner_id()
     if owner_id is None:
         return [TextContent(type="text", text="denied")]
@@ -410,30 +491,26 @@ async def handle_ask_melissa(args: dict[str, Any]) -> list[TextContent]:
     ts_ms = int(time.time() * 1000)
     msg = build_request(owner_id, request_id, action, why, tool_name, tool_input, ts_ms=ts_ms)
 
-    deadline = time.time() + timeout_seconds
-    add_pending(request_id, deadline, PENDING_PATH)
+    created = time.time()
+    add_pending(request_id, created + PENDING_TTL_SECONDS, PENDING_PATH, {
+        "id": request_id,
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "action": action,
+        "expected_text": expected_press_text(tool_name, tool_input, action),
+        "chat_id": owner_id,
+        "created": created,
+    })
     try:
         _write_outbox_message(ts_ms, msg)
-        loop = asyncio.get_running_loop()
-        verdict = await loop.run_in_executor(
-            None,
-            lambda: wait_for_answer(
-                INBOX_DIR,
-                PROCESSED_DIR,
-                request_id,
-                owner_id,
-                deadline,
-                POLL_INTERVAL_SECONDS,
-                expected_text=expected_press_text(tool_name, tool_input, action),
-            ),
-        )
-    finally:
+    except Exception:
         remove_pending(request_id, PENDING_PATH)
+        raise
 
-    if verdict == "approved":
-        approvals.grant(approvals.key(tool_name, tool_input), approvals.DEFAULT_PATH)
-
-    return [TextContent(type="text", text=verdict)]
+    return [TextContent(type="text", text=(
+        f"Asked Melissa (request {request_id}). Tell her briefly you're waiting for her tap, then "
+        "carry on with other messages. A system message will arrive when she answers; "
+        "retry the exact same call only after it says approved."))]
 
 
 server = Server("clawdaddy-approval")
@@ -446,11 +523,12 @@ async def list_tools() -> list[Tool]:
             name="ask_melissa",
             description=(
                 "Ask Melissa to approve one specific tool call the reach guard just "
-                "refused. Texts her Yes/No buttons on Telegram and blocks (up to "
-                "timeout_seconds, default and max 1800) until she answers. On "
-                "'approved', records a one-shot grant for the exact tool_name + "
-                "tool_input given here, so retrying that same call goes through. "
-                "Returns 'approved', 'denied', or 'timed out'."
+                "refused. Texts her Yes/No buttons on Telegram and returns at once; "
+                "it does not wait for her. When she answers (or after 30 minutes "
+                "without an answer) a system message arrives in the inbox saying "
+                "approved, declined, or expired. On approved, a one-shot grant "
+                "exists for the exact tool_name + tool_input given here, so "
+                "retrying that same call goes through."
             ),
             inputSchema={
                 "type": "object",
@@ -470,11 +548,6 @@ async def list_tools() -> list[Tool]:
                     "tool_input": {
                         "type": "object",
                         "description": "The exact tool_input you will retry with -- must match exactly for the grant to apply.",
-                    },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "Max seconds to wait for Melissa's answer. Default and max 1800.",
-                        "default": DEFAULT_TIMEOUT_SECONDS,
                     },
                 },
                 "required": ["action", "why", "tool_name", "tool_input"],

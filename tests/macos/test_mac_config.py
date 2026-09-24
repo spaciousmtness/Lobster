@@ -136,3 +136,11 @@ def test_plist_logs_outside_workspace():
         pl = _plist(name)
         for key in ("StandardOutPath", "StandardErrorPath"):
             assert pl[key].startswith("@HOME@/.local/state/clawdaddy/logs/"), (name, key, pl[key])
+
+
+def test_dispatcher_instructions_nonblocking_approval():
+    text = (MACOS / "CLAUDE.mac.md").read_text()
+    for needle in ("Melissa approved:", "Melissa declined:", "expired without an answer",
+                   "waiting for her tap"):
+        assert needle in text, needle
+    assert "blocks" not in text
