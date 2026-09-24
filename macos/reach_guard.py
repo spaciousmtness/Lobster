@@ -58,6 +58,7 @@ import fnmatch
 import json
 import os
 import re
+import stat
 import sys
 import time
 from pathlib import Path
@@ -166,7 +167,17 @@ DENY_NEEDS_APPROVAL = (
 # ---------------------------------------------------------------------------
 
 _BASH_BANNED_CHARS = frozenset("*?[{$`\\'\"")
-_BASH_BANNED_WORDS = frozenset({"cd", "pushd", "popd"})
+# Round 4: ln/link/pax can build a same-command symlink or hard link out of
+# the workspace, which no string check can follow.
+_BASH_BANNED_WORDS = frozenset({"cd", "pushd", "popd", "ln", "link", "pax"})
+
+# Round 4: a `file:` URL or a `%`-encoded byte lets curl & co. name a path
+# the tokenizer never sees literally.
+_BASH_BANNED_SUBSTRINGS = ("file:", "%")
+
+# Round 4: `~user`, `~+`, `~-` expand to paths we don't model; only a bare
+# `~` or `~/` is judged.
+_BASH_TILDE_FORM_RE = re.compile(r"~(?!/|$)")
 
 # Tokenizing splits on whitespace and these operators -- NOT on "/", so a
 # path's internal structure survives intact in one token.
@@ -186,8 +197,18 @@ def _bash_has_dotdot(command: str) -> bool:
 
 
 def _bash_has_banned_word(command: str) -> bool:
+    # Judged by basename too, so `/bin/ln` is `ln`.
     words = _BASH_SPLIT_RE.split(command)
-    return any(w in _BASH_BANNED_WORDS for w in words if w)
+    return any(w.rsplit("/", 1)[-1] in _BASH_BANNED_WORDS for w in words if w)
+
+
+def _bash_has_banned_substring(command: str) -> bool:
+    folded = command.casefold()
+    return any(s in folded for s in _BASH_BANNED_SUBSTRINGS)
+
+
+def _bash_has_tilde_form(command: str) -> bool:
+    return any(_BASH_TILDE_FORM_RE.search(t) for t in _bash_tokenize(command))
 
 
 def _bash_must_be_literal_violation(command: str) -> bool:
@@ -195,6 +216,8 @@ def _bash_must_be_literal_violation(command: str) -> bool:
         _bash_has_banned_chars(command)
         or _bash_has_dotdot(command)
         or _bash_has_banned_word(command)
+        or _bash_has_banned_substring(command)
+        or _bash_has_tilde_form(command)
     )
 
 
@@ -216,6 +239,16 @@ def _bash_subtokens(token: str) -> list[str]:
     return [t for t in _BASH_SUBTOKEN_SPLIT_RE.split(token) if t]
 
 
+def _bash_pieces(token: str) -> list[str]:
+    """The token, its @:,+ subtokens, and (round 4) every substring of the
+    token that starts at a "/" or "~" -- catches a path glued to a short
+    option (`-T/path`, `-o/path`, `-C/path`)."""
+    pieces = [token]
+    pieces.extend(_bash_subtokens(token))
+    pieces.extend(token[i:] for i, c in enumerate(token) if c in "/~" and i > 0)
+    return pieces
+
+
 def _decide_bash(
     tool_input: dict,
     home: Path,
@@ -231,11 +264,17 @@ def _decide_bash(
         return "deny", DENY_BASH_MUST_BE_LITERAL
 
     for token in _bash_tokenize(command):
-        pieces = [token]
-        pieces.extend(_bash_subtokens(token))
-        for piece in pieces:
+        for piece in _bash_pieces(token):
             resolved = _resolve(piece, resolved_cwd, home)
-            if _is_hard_denied(resolved, home, workspace, messages):
+            if (
+                _is_hard_denied(resolved, home, workspace, messages)
+                # Round 4: naming a folder that contains a secret (home,
+                # ~/.local, ~/messages, "/", ...) lets any recursive command
+                # walk into it, so it is refused like a recursive tool's target.
+                or _is_ancestor_of_denied(resolved, home)
+                or _is_ancestor_of_messages_denied(resolved, messages)
+                or _is_hard_link(resolved)
+            ):
                 return "deny", DENY_NEVER_ALLOWED
 
     k = approvals.key("Bash", tool_input)
@@ -276,14 +315,38 @@ def _expand_home(raw: str, home: Path) -> Path:
     return Path(raw)
 
 
+_FIRMLINK_PARTS = ("/", "system", "volumes", "data")
+
+
+def _strip_firmlink(p: Path) -> Path:
+    """/System/Volumes/Data/<x> is the same file as /<x> on macOS (the data
+    volume's firmlink), and resolve() does not undo it -- so strip it,
+    string-level, before any check sees the path."""
+    parts = p.parts
+    if tuple(x.casefold() for x in parts[:4]) == _FIRMLINK_PARTS:
+        return Path("/", *parts[4:])
+    return p
+
+
 def _resolve(raw: str, base: Path, home: Path) -> Path:
     p = _expand_home(raw, home)
     if not p.is_absolute():
         p = base / p
     try:
-        return p.resolve()  # resolves symlinks, so a link out is judged by its target
+        p = p.resolve()  # resolves symlinks, so a link out is judged by its target
     except (OSError, RuntimeError):
-        return p
+        pass
+    return _strip_firmlink(p)
+
+
+def _is_hard_link(p: Path) -> bool:
+    """A regular file with more than one link may be the same inode as a
+    secret elsewhere; path checks can't see that, so refuse it."""
+    try:
+        st = p.stat()
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_nlink > 1
 
 
 def _pattern_fixed_prefix(pattern: str) -> str:
@@ -500,9 +563,11 @@ def decide(
     cwd: "str | Path | None" = None,
     messages: "str | Path | None" = None,
 ) -> tuple[str, str]:
-    home = Path(home).resolve()
-    workspace = Path(workspace).resolve()
-    messages = Path(messages).resolve() if messages is not None else (home / "messages").resolve()
+    home = _strip_firmlink(Path(home).resolve())
+    workspace = _strip_firmlink(Path(workspace).resolve())
+    messages = _strip_firmlink(
+        Path(messages).resolve() if messages is not None else (home / "messages").resolve()
+    )
 
     # Rule 0: an unlisted tool is refused outright.
     if not _tool_allowed(tool_name):
@@ -535,6 +600,10 @@ def decide(
 
     # Rule 1: hard-denied locations always lose, grant or no grant.
     if any(_is_hard_denied(r, home, workspace, messages) for r in resolved_paths):
+        return "deny", DENY_NEVER_ALLOWED
+
+    # Round 4: a hard-linked regular file may be a secret under another name.
+    if any(_is_hard_link(r) for r in resolved_paths):
         return "deny", DENY_NEVER_ALLOWED
 
     # Rule 6: a recursive tool whose target contains a hard-denied location
