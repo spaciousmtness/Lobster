@@ -37,10 +37,10 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>@HOME@/lobster-workspace/logs/update-check-stdout.log</string>
+    <string>@HOME@/.local/state/clawdaddy/logs/update-check-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>@HOME@/lobster-workspace/logs/update-check-stderr.log</string>
+    <string>@HOME@/.local/state/clawdaddy/logs/update-check-stderr.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>

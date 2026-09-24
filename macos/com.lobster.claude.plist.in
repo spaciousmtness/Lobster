@@ -13,6 +13,11 @@
   claude-persistent.sh needs BASHPID, which macOS's bundled bash (3.2) does
   not have, so it is run with /opt/homebrew/bin/bash explicitly rather than
   relying on its own shebang.
+
+  WorkingDirectory is the repo, not the workspace: the launcher runs
+  python3 itself, and nothing it runs should start in a folder the agent
+  can write. It cd's into the workspace only in the subshell that execs
+  claude.
 -->
 <plist version="1.0">
 <dict>
@@ -27,7 +32,7 @@
     </array>
 
     <key>WorkingDirectory</key>
-    <string>@HOME@/lobster-workspace</string>
+    <string>@HOME@/lobster</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -39,10 +44,10 @@
     <integer>30</integer>
 
     <key>StandardOutPath</key>
-    <string>@HOME@/lobster-workspace/logs/claude-stdout.log</string>
+    <string>@HOME@/.local/state/clawdaddy/logs/claude-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>@HOME@/lobster-workspace/logs/claude-stderr.log</string>
+    <string>@HOME@/.local/state/clawdaddy/logs/claude-stderr.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>

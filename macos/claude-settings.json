@@ -47,7 +47,28 @@
       "Edit(~/.local/state/clawdaddy/**)",
       "Edit(~/messages/inbox/**)",
       "Edit(~/messages/config/**)",
-      "Edit(~/lobster-workspace/.claude/**)"
+      "Edit(~/lobster-workspace/.claude/**)",
+      "Read(~/messages/outbox/**)",
+      "Edit(~/messages/outbox/**)",
+      "Read(~/messages/sent/**)",
+      "Edit(~/messages/sent/**)",
+      "Edit(~/lobster/**)",
+      "Edit(~/Library/**)",
+      "Edit(~/.claude/**)",
+      "Edit(~/.config/**)",
+      "Edit(~/.local/**)",
+      "Edit(~/.zshrc)",
+      "Edit(~/.zprofile)",
+      "Edit(~/.zshenv)",
+      "Edit(~/.zlogin)",
+      "Edit(~/.zlogout)",
+      "Edit(~/.bashrc)",
+      "Edit(~/.bash_profile)",
+      "Edit(~/.bash_login)",
+      "Edit(~/.profile)",
+      "Edit(~/.gitconfig)",
+      "Edit(//opt/homebrew/**)",
+      "Edit(//usr/local/**)"
     ]
   },
   "sandbox": {
@@ -82,7 +103,9 @@
         "~/.local/state/clawdaddy",
         "~/messages/inbox",
         "~/messages/config",
-        "~/lobster-workspace/.claude"
+        "~/lobster-workspace/.claude",
+        "~/messages/outbox",
+        "~/messages/sent"
       ]
     },
     "network": {

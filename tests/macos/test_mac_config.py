@@ -59,3 +59,80 @@ def test_dispatcher_instructions():
                    "[Button pressed: deny:", "mark_processed", "literal",
                    "never allowed: command must be literal"):
         assert needle in text, needle
+
+
+# ---------------------------------------------------------------------------
+# Final fix wave
+# ---------------------------------------------------------------------------
+import re
+import plistlib
+
+REPO = MACOS.parent
+
+
+def _mac_env():
+    env = {}
+    for line in (MACOS / "mac.env").read_text().splitlines():
+        m = re.match(r'^([A-Z_]+)="?(.*?)"?$', line)
+        if m:
+            env[m.group(1)] = m.group(2)
+    return env
+
+
+# C2: Claude Code's own permission layer mirrors the guard's write floor.
+def test_edit_denies_mirror_write_floor():
+    deny = set(_settings()["permissions"]["deny"])
+    for p in ("~/lobster/**", "~/Library/**", "~/.claude/**", "~/.config/**", "~/.local/**",
+              "~/.zshrc", "~/.zprofile", "~/.zshenv", "~/.zlogin", "~/.bashrc", "~/.bash_profile",
+              "~/.profile", "~/.gitconfig",
+              # Claude Code permission rules: "//" is an absolute path, "/" is settings-relative.
+              "//opt/homebrew/**", "//usr/local/**"):
+        assert f"Edit({p})" in deny, p
+
+
+# I3: outbox/ and sent/ are unreadable at every layer.
+def test_outbox_and_sent_denied_everywhere():
+    s = _settings()
+    deny = set(s["permissions"]["deny"])
+    fs = s["sandbox"]["filesystem"]
+    for sub in ("outbox", "sent"):
+        assert f"Read(~/messages/{sub}/**)" in deny
+        assert f"~/messages/{sub}" in fs["denyRead"]
+
+
+# C3 / M3 / I4: mac.env points Lobster at the right dirs.
+def test_mac_env_dirs():
+    env = _mac_env()
+    assert env["LOBSTER_USER_CONFIG"] == "$HOME/lobster-workspace/user-config"
+    assert env["LOBSTER_CONFIG_DIR"] == "$HOME/lobster/config"
+    assert env["LOBSTER_LOG_DIR"] == "$HOME/.local/state/clawdaddy/logs"
+
+
+# C3: the dispatcher is told where its instructions are and what to skip.
+def test_dispatcher_instructions_bootup():
+    text = (MACOS / "CLAUDE.mac.md").read_text()
+    bootup = (REPO / ".claude" / "sys.dispatcher.bootup.md").read_text()
+    for needle in ("~/lobster/CLAUDE.md", "~/lobster/.claude/sys.dispatcher.bootup.md",
+                   "~/lobster-workspace/user-config", "~/lobster-user-config"):
+        assert needle in text, needle
+    # Steps 2c and 2e are the non-literal Bash ones; name them exactly as the bootup file does.
+    assert re.search(r"^2c\. Check `~/lobster-workspace/data/context-handoff.json`", bootup, re.M)
+    assert re.search(r"^2e\. \*\*Check for a debug-mode reflection prompt sidecar\*\*", bootup, re.M)
+    assert re.search(r"[Ss]kip.*\b2c\b.*context-handoff", text)
+    assert re.search(r"[Ss]kip.*\b2e\b.*bootup-prompt", text)
+
+
+# C1 / I4: launchd runs the launcher from ~/lobster and logs outside the workspace.
+def _plist(name):
+    return plistlib.loads((MACOS / f"{name}.plist.in").read_bytes())
+
+
+def test_claude_plist_working_directory_is_repo():
+    assert _plist("com.lobster.claude")["WorkingDirectory"] == "@HOME@/lobster"
+
+
+def test_plist_logs_outside_workspace():
+    for name in ("com.lobster.claude", "com.lobster.router", "com.lobster.update-check"):
+        pl = _plist(name)
+        for key in ("StandardOutPath", "StandardErrorPath"):
+            assert pl[key].startswith("@HOME@/.local/state/clawdaddy/logs/"), (name, key, pl[key])

@@ -35,10 +35,10 @@
     <integer>30</integer>
 
     <key>StandardOutPath</key>
-    <string>@HOME@/lobster-workspace/logs/router-stdout.log</string>
+    <string>@HOME@/.local/state/clawdaddy/logs/router-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>@HOME@/lobster-workspace/logs/router-stderr.log</string>
+    <string>@HOME@/.local/state/clawdaddy/logs/router-stderr.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
