@@ -90,3 +90,6 @@ lobster-shop/kissinger/context/reference.md
 
 # Stray backup files (should never be committed)
 *.bak
+
+# Rendered per machine by macos/install.sh from macos/mcp.json.in
+macos/mcp.json

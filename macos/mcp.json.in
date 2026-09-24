@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "lobster-inbox": {
+      "command": "@HOME@/lobster/.venv/bin/python",
+      "args": ["@HOME@/lobster/src/mcp/inbox_server.py"],
+      "env": { "LOBSTER_MAIN_SESSION": "1" }
+    },
+    "clawdaddy-approval": {
+      "command": "@HOME@/lobster/.venv/bin/python",
+      "args": ["@HOME@/lobster/macos/approval_server.py"]
+    }
+  }
+}

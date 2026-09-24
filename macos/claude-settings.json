@@ -1,0 +1,68 @@
+{
+  "env": {
+    "ENABLE_TOOL_SEARCH": "false"
+  },
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "Bash",
+      "WebFetch",
+      "WebSearch",
+      "Task",
+      "mcp__lobster-inbox",
+      "mcp__clawdaddy-approval"
+    ],
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(~/Library/Keychains/**)",
+      "Read(~/.config/clawdaddy/**)",
+      "Read(~/.freedom/**)",
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/lobster/config/config.env)",
+      "Read(~/.local/state/clawdaddy/**)",
+      "Read(~/messages/inbox/**)",
+      "Read(~/messages/config/**)",
+      "Edit(~/.ssh/**)",
+      "Edit(~/Library/Keychains/**)",
+      "Edit(~/.config/clawdaddy/**)",
+      "Edit(~/.freedom/**)",
+      "Edit(~/.claude/.credentials.json)",
+      "Edit(~/lobster/config/config.env)",
+      "Edit(~/.local/state/clawdaddy/**)",
+      "Edit(~/messages/inbox/**)",
+      "Edit(~/messages/config/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "allowUnsandboxedCommands": false,
+    "failIfUnavailable": true,
+    "filesystem": {
+      "allowWrite": ["~/lobster-workspace"],
+      "denyWrite": ["~/.ssh", "~/Library", "~/.freedom", "~/lobster", "~/messages", "~/.local/state/clawdaddy"],
+      "denyRead": ["~/.ssh", "~/.gnupg", "~/Library/Keychains", "~/.config/clawdaddy", "~/.freedom", "~/lobster/config", "~/.local/state/clawdaddy"]
+    },
+    "network": {
+      "allowedDomains": [],
+      "strictAllowlist": true
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/lobster/.venv/bin/python $HOME/lobster/macos/reach_guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}

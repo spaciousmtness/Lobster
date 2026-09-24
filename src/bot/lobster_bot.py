@@ -16,6 +16,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import shutil
+import shlex
 import subprocess
 import threading
 import time
@@ -675,11 +676,20 @@ def _read_lobster_state() -> str:
         return "active"
 
 
+def _claude_match_pattern() -> str:
+    """pgrep/pkill pattern for the dispatcher Claude process.
+
+    Linux launches it with --dangerously-skip-permissions; the Mac launches it
+    with its own settings file and sets LOBSTER_CLAUDE_MATCH accordingly.
+    """
+    return os.environ.get("LOBSTER_CLAUDE_MATCH", "claude.*--dangerously-skip-permissions")
+
+
 def _is_claude_running() -> bool:
-    """Return True if a Claude process with --dangerously-skip-permissions is running."""
+    """Return True if the dispatcher Claude process (LOBSTER_CLAUDE_MATCH) is running."""
     try:
         result = subprocess.run(
-            ["pgrep", "-f", "claude.*--dangerously-skip-permissions"],
+            ["pgrep", "-f", _claude_match_pattern()],
             capture_output=True,
             text=True,
         )
@@ -719,10 +729,10 @@ def _is_hibernate_stale(state_data: dict, max_age_seconds: int = 60) -> bool:
 
 
 def _kill_stale_claude() -> None:
-    """Kill any stale Claude processes matching --dangerously-skip-permissions."""
+    """Kill any stale dispatcher Claude processes (LOBSTER_CLAUDE_MATCH)."""
     try:
         subprocess.run(
-            ["pkill", "-f", "claude.*--dangerously-skip-permissions"],
+            ["pkill", "-f", _claude_match_pattern()],
             capture_output=True,
             text=True,
         )
@@ -812,6 +822,28 @@ def wake_claude_if_hibernating() -> None:
         # instance and a crash loop. The fallback has been removed: if
         # systemctl restart fails for any reason, wait_for_wake() (polling
         # every 10s) and health-check-v3.sh (every 4 min) provide recovery.
+        # LOBSTER_WAKE_CMD overrides the restart command (the Mac sets it to
+        # a launchctl kickstart of the com.lobster.claude agent).
+        wake_cmd = os.environ.get("LOBSTER_WAKE_CMD", "").strip()
+        if wake_cmd:
+            try:
+                result = subprocess.run(
+                    shlex.split(wake_cmd),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode == 0:
+                    log.info(f"wake_claude: '{wake_cmd}' succeeded")
+                else:
+                    log.error(
+                        f"wake_claude: '{wake_cmd}' exited {result.returncode}: "
+                        f"{result.stderr.strip()} — wait_for_wake() will recover"
+                    )
+            except Exception as e:
+                log.error(f"wake_claude: '{wake_cmd}' failed ({e}) — wait_for_wake() will recover")
+            return
+
         try:
             result = subprocess.run(
                 ["sudo", "systemctl", "restart", "lobster-claude"],

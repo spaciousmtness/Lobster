@@ -242,7 +242,8 @@ except Exception:
 #   clean new session from launching.
 #
 # Safety contract:
-#   - Only kills processes matching "claude.*--dangerously-skip-permissions"
+#   - Only kills processes matching $LOBSTER_CLAUDE_MATCH (default
+#     "claude.*--dangerously-skip-permissions")
 #   - Walks up to 8 ancestor levels to check lineage
 #   - Any process whose ancestor chain reaches a current tmux pane PID is
 #     considered "ours" and is left alone
@@ -260,7 +261,7 @@ kill_orphaned_claude_processes() {
 
     # If tmux session doesn't exist yet, any found claude process is an orphan
     local claude_pids
-    claude_pids=$(pgrep -f "claude.*--dangerously-skip-permissions" 2>/dev/null || true)
+    claude_pids=$(pgrep -f "${LOBSTER_CLAUDE_MATCH:-claude.*--dangerously-skip-permissions}" 2>/dev/null || true)
 
     if [[ -z "$claude_pids" ]]; then
         log "CLEANUP: No stale Claude processes found"
@@ -460,6 +461,31 @@ kill_orphaned_mcp_processes() {
 }
 
 #===============================================================================
+# Exec the dispatcher claude process
+#
+# Permission flags come from $LOBSTER_CLAUDE_FLAGS (the Mac sets it to a
+# --settings/--permission-mode dontAsk set; see macos/CLAUDE.mac.md) and fall
+# back to --dangerously-skip-permissions (the Linux path). The value holds
+# several words, so it is split on whitespace into an array (no globbing), and
+# a literal $HOME / ${HOME} in any word is expanded, because launchd passes
+# environment values through without shell expansion.
+#===============================================================================
+exec_claude_dispatcher() {
+    local prompt="$1"
+    local -a flags=()
+    read -r -a flags <<< "${LOBSTER_CLAUDE_FLAGS:---dangerously-skip-permissions}"
+    local i
+    for i in "${!flags[@]}"; do
+        flags[$i]="${flags[$i]//\$\{HOME\}/$HOME}"
+        flags[$i]="${flags[$i]//\$HOME/$HOME}"
+    done
+    exec claude "${flags[@]}" \
+        --model sonnet \
+        --max-turns 150 \
+        -p "$prompt"
+}
+
+#===============================================================================
 # Launch Claude in persistent mode
 #===============================================================================
 launch_claude() {
@@ -598,10 +624,7 @@ launch_claude() {
         # injects dispatcher bootup context. Stale flags (dead PID) are ignored.
         mkdir -p "$WORKSPACE_DIR/data"
         echo "$BASHPID" > "$WORKSPACE_DIR/data/dispatcher-startup-flag"
-        exec claude --dangerously-skip-permissions \
-            --model sonnet \
-            --max-turns 150 \
-            -p "$init_prompt"
+        exec_claude_dispatcher "$init_prompt"
     ) 2>&1 | tee -a "$LOG_DIR/claude-session.log" || claude_exit_code=$?
 
     # Clean up PID file on exit — the process is gone, the file is stale.
