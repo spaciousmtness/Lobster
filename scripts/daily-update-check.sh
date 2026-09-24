@@ -24,22 +24,27 @@ cd "$LOBSTER_DIR"
 
 # Support both git and tarball installs
 if [ -d "$LOBSTER_DIR/.git" ]; then
-    git fetch origin main --quiet
+    REMOTE="${LOBSTER_UPDATE_REMOTE:-origin}"
+    git fetch "$REMOTE" main --quiet
 
     LOCAL=$(git rev-parse HEAD)
-    REMOTE=$(git rev-parse origin/main)
+    REMOTE_SHA=$(git rev-parse "$REMOTE/main")
 
-    if [ "$LOCAL" != "$REMOTE" ]; then
-        BEHIND=$(git rev-list --count "$LOCAL..$REMOTE")
-        TIMESTAMP=$(date +%s%3N)
-        _json_build_message \
-            --arg id "${TIMESTAMP}_update_available" \
-            --arg source "system" \
-            --argjson chat_id 0 \
-            --arg type "update_notification" \
-            --arg text "UPDATE AVAILABLE: Lobster is ${BEHIND} commits behind origin/main. Use check_updates for details." \
-            --arg timestamp "$(date -Iseconds)" \
-            > "$INBOX/${TIMESTAMP}_update_available.json"
+    if [ "$LOCAL" != "$REMOTE_SHA" ]; then
+        # Count only commits not already merged, so a Mac install ahead of
+        # $REMOTE/main by its own local commits isn't reported as behind.
+        BEHIND=$(git rev-list --count "HEAD..$REMOTE/main")
+        if [ "$BEHIND" -gt 0 ]; then
+            TIMESTAMP=$(date +%s%3N)
+            _json_build_message \
+                --arg id "${TIMESTAMP}_update_available" \
+                --arg source "system" \
+                --argjson chat_id 0 \
+                --arg type "update_notification" \
+                --arg text "UPDATE AVAILABLE: Lobster is ${BEHIND} commits behind ${REMOTE}/main. Use check_updates for details." \
+                --arg timestamp "$(date -Iseconds)" \
+                > "$INBOX/${TIMESTAMP}_update_available.json"
+        fi
     fi
 else
     # Tarball mode: check GitHub Releases API

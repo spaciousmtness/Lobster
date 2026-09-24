@@ -142,15 +142,16 @@ class UpdateManager:
     # =========================================================================
 
     def _check_git_updates(self) -> dict:
-        self._git("fetch", "origin", "main")
+        remote = os.environ.get("LOBSTER_UPDATE_REMOTE", "origin")
+        self._git("fetch", remote, "main")
         local_sha = self._git("rev-parse", "HEAD").strip()
-        remote_sha = self._git("rev-parse", "origin/main").strip()
+        remote_sha = self._git("rev-parse", f"{remote}/main").strip()
 
         if local_sha == remote_sha:
             return {"updates_available": False, "local_sha": local_sha}
 
-        behind_count = self._git("rev-list", "--count", f"{local_sha}..{remote_sha}").strip()
-        log = self._git("log", "--oneline", f"{local_sha}..{remote_sha}")
+        behind_count = self._git("rev-list", "--count", f"HEAD..{remote}/main").strip()
+        log = self._git("log", "--oneline", f"HEAD..{remote}/main")
 
         return {
             "updates_available": True,
@@ -234,6 +235,13 @@ class UpdateManager:
             "recommendation": "auto-update" if (safe and not issues) else "manual review needed",
         }
 
+    # macOS's default filesystem is case-insensitive: docs/SLACK-SETUP.md and
+    # docs/slack-setup.md collide on disk, so `git status` can report the
+    # tracked path as modified with no real edit behind it -- a symptom of
+    # the collision, not something anyone touched by hand. Tolerated
+    # narrowly, by exact path, so it can never mask a genuinely dirty tree.
+    _CASE_COLLISION_PHANTOM_PATHS = frozenset({"docs/SLACK-SETUP.md", "docs/slack-setup.md"})
+
     def _execute_git_update(self) -> dict:
         compat = self.analyze_compatibility()
         if not compat["safe_to_update"]:
@@ -242,27 +250,101 @@ class UpdateManager:
                 "message": "Cannot auto-update. Issues: " + "; ".join(compat["issues"]),
             }
 
+        remote = os.environ.get("LOBSTER_UPDATE_REMOTE", "origin")
+
         try:
-            current_sha = self._git("rev-parse", "HEAD").strip()
-            self._git("pull", "origin", "main", "--ff-only")
-            new_sha = self._git("rev-parse", "HEAD").strip()
+            self._git("fetch", remote, "main")
 
-            if os.path.exists(self.repo_path / "requirements.txt"):
-                subprocess.run(
-                    ["pip", "install", "-r", "requirements.txt", "--quiet"],
-                    cwd=self.repo_path,
-                    capture_output=True,
-                )
+            if remote == "origin" and self._is_ancestor("HEAD", "origin/main"):
+                # No local divergence from origin/main: keep the original
+                # fast-forward-only path (this is what a plain Linux install,
+                # or any dev machine tracking origin with no local commits,
+                # always hits).
+                current_sha = self._git("rev-parse", "HEAD").strip()
+                self._git("pull", "origin", "main", "--ff-only")
+                new_sha = self._git("rev-parse", "HEAD").strip()
 
-            return {
-                "success": True,
-                "previous_sha": current_sha,
-                "current_sha": new_sha,
-                "message": f"Updated from {current_sha[:7]} to {new_sha[:7]}",
-                "rollback_command": f"git reset --hard {current_sha}",
-            }
+                if os.path.exists(self.repo_path / "requirements.txt"):
+                    subprocess.run(
+                        ["pip", "install", "-r", "requirements.txt", "--quiet"],
+                        cwd=self.repo_path,
+                        capture_output=True,
+                    )
+
+                return {
+                    "success": True,
+                    "previous_sha": current_sha,
+                    "current_sha": new_sha,
+                    "message": f"Updated from {current_sha[:7]} to {new_sha[:7]}",
+                    "rollback_command": f"git reset --hard {current_sha}",
+                }
+
+            return self._execute_merge_update(remote)
         except Exception as e:
             return {"success": False, "message": str(e)}
+
+    def _execute_merge_update(self, remote: str) -> dict:
+        """Merge <remote>/main into HEAD, with rollback on conflict or a
+        failing selfcheck. Only reached when the ff-only path above does not
+        apply: a non-origin remote (Clawdaddy's `upstream`), or HEAD has
+        diverged from origin/main (local commits on top of it)."""
+        status = self._git("status", "--porcelain", "--untracked-files=no")
+        dirty = [
+            line for line in status.splitlines()
+            if line.strip() and line[3:].strip() not in self._CASE_COLLISION_PHANTOM_PATHS
+        ]
+        if dirty:
+            return {"success": False, "error": "dirty tree"}
+
+        previous_sha = self._git("rev-parse", "HEAD").strip()
+
+        merge = subprocess.run(
+            ["git", "merge", "--no-edit", f"{remote}/main"],
+            cwd=self.repo_path,
+            capture_output=True,
+            text=True,
+        )
+
+        if merge.returncode != 0:
+            conflicts = self._git("diff", "--name-only", "--diff-filter=U").strip()
+            # git reset --hard is allowed only inside this rollback branch,
+            # only to the sha this same call recorded above, and only after
+            # a merge this same call made -- never on the caller's say-so.
+            subprocess.run(["git", "merge", "--abort"], cwd=self.repo_path, capture_output=True)
+            return {
+                "success": False,
+                "error": "conflict",
+                "files": conflicts.split("\n") if conflicts else [],
+            }
+
+        new_sha = self._git("rev-parse", "HEAD").strip()
+
+        selfcheck_cmd = os.environ.get("LOBSTER_SELFCHECK_CMD")
+        if selfcheck_cmd:
+            selfcheck = subprocess.run(selfcheck_cmd, shell=True, cwd=self.repo_path, capture_output=True)
+        else:
+            selfcheck = subprocess.run(
+                ["bash", "macos/selfcheck.sh"], cwd=self.repo_path, capture_output=True,
+            )
+
+        if selfcheck.returncode != 0:
+            self._git("reset", "--hard", previous_sha)
+            return {"success": False, "error": "selfcheck failed, rolled back"}
+
+        return {
+            "success": True,
+            "previous_sha": previous_sha,
+            "current_sha": new_sha,
+            "message": f"Merged {remote}/main: {previous_sha[:7]} to {new_sha[:7]}",
+        }
+
+    def _is_ancestor(self, commit: str, of: str) -> bool:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, of],
+            cwd=self.repo_path,
+            capture_output=True,
+        )
+        return result.returncode == 0
 
     def _git(self, *args) -> str:
         result = subprocess.run(
