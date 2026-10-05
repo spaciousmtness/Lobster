@@ -12,6 +12,14 @@
 # with /opt/homebrew/bin/bash explicitly by the plist that runs it.
 set -euo pipefail
 
+# ~/.freedom/PAUSE is the machine-wide off switch: start nothing while it
+# exists. KeepAlive agents relaunch this every ThrottleInterval and exit here
+# again; processes already running keep going until they restart.
+if [ -e "$HOME/.freedom/PAUSE" ]; then
+  echo "lobster: paused ($HOME/.freedom/PAUSE exists)"
+  exit 0
+fi
+
 set -a
 # shellcheck disable=SC1091
 . "$HOME/lobster/config/config.env"
